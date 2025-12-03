@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package dispatch.v1;
+
+option go_package = "github.com/ronnitchopra/dispatch/gen/task/v1;taskv1";
+
+import "google/protobuf/timestamp.proto";
+
+// Priority levels for task scheduling.
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_LOW         = 1;
+  PRIORITY_MEDIUM      = 2;
+  PRIORITY_HIGH        = 3;
+  PRIORITY_CRITICAL    = 4;
+}
+
+// TaskStatus represents the lifecycle state of a task.
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_PENDING     = 1;
+  TASK_STATUS_RUNNING     = 2;
+  TASK_STATUS_COMPLETED   = 3;
+  TASK_STATUS_FAILED      = 4;
+  TASK_STATUS_CANCELLED   = 5;
+}
+
+// SubmitStatus is the server's verdict on a task submission.
+enum SubmitStatus {
+  SUBMIT_STATUS_UNSPECIFIED = 0;
+  SUBMIT_STATUS_ACCEPTED    = 1;
+  SUBMIT_STATUS_REJECTED    = 2;
+}
+
+// Task is the core unit of work submitted by a client.
+message Task {
+  // Client-supplied idempotency key. If empty, the server generates a UUID.
+  // Resubmitting the same key returns the original task_id (at-least-once safety).
+  string idempotency_key = 1;
+
+  // Machine-readable task type consumed by the worker (e.g. "video_transcode").
+  string type = 2;
+
+  // Opaque payload; the worker deserializes it based on `type`.
+  bytes payload = 3;
+
+  Priority priority = 4;
+
+  // Absolute deadline; the scheduler must not dispatch the task after this time.
+  google.protobuf.Timestamp deadline = 5;
+
+  // Arbitrary key-value labels for tracing, routing, and observability.
+  map<string, string> metadata = 6;
+
+  // Maximum number of automatic retry attempts on failure.
+  int32 max_retries = 7;
+}
+
+message SubmitTaskRequest {
+  Task task = 1;
+}
+
+message SubmitTaskResponse {
+  SubmitStatus status = 1;
+
+  // Canonical task ID: either the provided idempotency_key or a server-generated UUID.
+  string task_id = 2;
+
+  // Human-readable business-logic rejection reason (populated only when REJECTED).
+  // Use standard gRPC status codes for network/auth failures.
+  string error_message = 3;
+}
+
+// ProgressUpdate is sent by a worker to report status on a task.
+// A single long-lived stream can report updates for multiple tasks.
+message ProgressUpdate {
+  string worker_id = 1;
+  string task_id   = 2;
+
+  TaskStatus status = 3;
+
+  // Completion percentage: 0–100.
+  int32 progress = 4;
+
+  google.protobuf.Timestamp timestamp = 5;
+}
+
+// ProgressAck is the server's acknowledgment that a progress update was recorded.
+message ProgressAck {
+  bool recorded = 1;
+}
+
+// DispatchService is the core scheduling API.
+service DispatchService {
+  // SubmitTask accepts a job from a client and returns an assigned task ID.
+  rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+
+  // ReportProgress is a bidirectional stream. A worker opens one long-lived
+  // stream and sends progress updates for multiple tasks; the server acknowledges each.
+  rpc ReportProgress(stream ProgressUpdate) returns (stream ProgressAck);
+}
