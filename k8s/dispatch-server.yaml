@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dispatch-server
+  labels:
+    app: dispatch-server
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dispatch-server
+  template:
+    metadata:
+      labels:
+        app: dispatch-server
+    spec:
+      containers:
+        - name: dispatch-server
+          image: dispatch-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc
+              containerPort: 50051
+            - name: metrics
+              containerPort: 9090
+          env:
+            - name: REDIS_ADDR
+              value: "redis.default.svc.cluster.local:6379"
+            - name: KAFKA_BROKER
+              value: "kafka.default.svc.cluster.local:9092"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dispatch-server
+  labels:
+    app: dispatch-server
+spec:
+  selector:
+    app: dispatch-server
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
