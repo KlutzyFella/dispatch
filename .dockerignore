@@ -1,0 +1,7 @@
+.git/
+bin/
+k8s/
+coverage.out
+*.tar.gz
+docker-compose.yml
+prometheus.yml
