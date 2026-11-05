@@ -74,16 +74,6 @@ func (m *mockSender) SendUpdate(u *taskv1.ProgressUpdate) (*taskv1.ProgressAck, 
 	return &taskv1.ProgressAck{Recorded: true}, nil
 }
 
-// mockLocker implements TaskLocker for testing.
-type mockLocker struct {
-	acquired bool
-	err      error
-}
-
-func (m *mockLocker) AcquireLock(_ context.Context, _ string, _ time.Duration) (bool, error) {
-	return m.acquired, m.err
-}
-
 // mockDLQPublisher implements DLQPublisher for testing.
 type mockDLQPublisher struct {
 	published []string // task IDs published
@@ -101,11 +91,10 @@ func (m *mockDLQPublisher) Publish(_ context.Context, taskID string, _ *taskv1.T
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 // newTestConsumer builds a minimal Consumer for unit tests.
-// locker defaults to always-granted; failureDecider defaults to never-fail.
+// failureDecider defaults to never-fail.
 func newTestConsumer(sender ProgressSender) *Consumer {
 	return &Consumer{
 		reporter:       sender,
-		locker:         &mockLocker{acquired: true},
 		failureDecider: func() bool { return false },
 		workerID:       "test-worker",
 		logger:         slog.New(slog.NewTextHandler(os.Stderr, nil)),
@@ -223,63 +212,6 @@ func TestProcessMessage_ReporterFailsOnRunning(t *testing.T) {
 	}
 }
 
-// ── processMessage: locking ────────────────────────────────────────────────────
-
-func TestProcessMessage_LockGranted(t *testing.T) {
-	t.Parallel()
-
-	sender := &mockSender{}
-	c := newTestConsumer(sender)
-	c.locker = &mockLocker{acquired: true}
-
-	task := &taskv1.Task{Type: "batch"}
-	payload := marshalTask(t, task)
-
-	if err := c.processMessage(context.Background(), []byte("task-locked"), payload); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if sender.callCount != 2 {
-		t.Errorf("expected 2 SendUpdate calls, got %d", sender.callCount)
-	}
-}
-
-func TestProcessMessage_LockDenied(t *testing.T) {
-	t.Parallel()
-
-	sender := &mockSender{}
-	c := newTestConsumer(sender)
-	c.locker = &mockLocker{acquired: false}
-
-	task := &taskv1.Task{Type: "batch"}
-	payload := marshalTask(t, task)
-
-	if err := c.processMessage(context.Background(), []byte("task-deny"), payload); err != nil {
-		t.Fatalf("expected nil (skip), got %v", err)
-	}
-	// No updates should be sent — task was skipped.
-	if sender.callCount != 0 {
-		t.Errorf("expected 0 SendUpdate calls when lock denied, got %d", sender.callCount)
-	}
-}
-
-func TestProcessMessage_LockError(t *testing.T) {
-	t.Parallel()
-
-	sender := &mockSender{}
-	c := newTestConsumer(sender)
-	c.locker = &mockLocker{err: errors.New("redis error")}
-
-	task := &taskv1.Task{Type: "batch"}
-	payload := marshalTask(t, task)
-
-	if err := c.processMessage(context.Background(), []byte("task-lockerr"), payload); err == nil {
-		t.Fatal("expected error from lock failure, got nil")
-	}
-	if sender.callCount != 0 {
-		t.Errorf("expected 0 SendUpdate calls on lock error, got %d", sender.callCount)
-	}
-}
-
 // ── processMessage: failure / DLQ ─────────────────────────────────────────────
 
 func TestProcessMessage_FailureWithRetriesRemaining(t *testing.T) {
@@ -375,12 +307,11 @@ func TestNewConsumer_InitialisesFields(t *testing.T) {
 	t.Parallel()
 
 	sender := &mockSender{}
-	locker := &mockLocker{acquired: true}
 	dlq := &mockDLQPublisher{}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	c := NewConsumer("localhost:9092", "tasks.pending", "dispatch-workers", "w-1",
-		sender, locker, dlq, logger)
+		sender, dlq, logger)
 	if c == nil {
 		t.Fatal("expected non-nil Consumer")
 	}
@@ -389,9 +320,6 @@ func TestNewConsumer_InitialisesFields(t *testing.T) {
 	}
 	if c.reader == nil {
 		t.Error("expected non-nil kafka.Reader")
-	}
-	if c.locker == nil {
-		t.Error("expected non-nil locker")
 	}
 	if err := c.Close(); err != nil {
 		t.Fatalf("unexpected error on Close: %v", err)

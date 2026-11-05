@@ -14,13 +14,11 @@ import (
 type memoryStore struct {
 	mu    sync.RWMutex
 	tasks map[string]state.TaskRecord
-	locks map[string]struct{}
 }
 
 func newMemoryStore() *memoryStore {
 	return &memoryStore{
 		tasks: make(map[string]state.TaskRecord),
-		locks: make(map[string]struct{}),
 	}
 }
 
@@ -60,16 +58,6 @@ func (m *memoryStore) DeleteTask(_ context.Context, taskID string) error {
 	defer m.mu.Unlock()
 	delete(m.tasks, taskID)
 	return nil
-}
-
-func (m *memoryStore) AcquireLock(_ context.Context, taskID string, _ time.Duration) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, held := m.locks[taskID]; held {
-		return false, nil
-	}
-	m.locks[taskID] = struct{}{}
-	return true, nil
 }
 
 // compile-time check that memoryStore satisfies the interface.
@@ -172,28 +160,5 @@ func TestMemoryStore_DeleteTask(t *testing.T) {
 	_, err := store.GetTask(ctx, "task-3")
 	if !errors.Is(err, state.ErrTaskNotFound) {
 		t.Errorf("expected ErrTaskNotFound after delete, got %v", err)
-	}
-}
-
-func TestMemoryStore_AcquireLock(t *testing.T) {
-	t.Parallel()
-
-	store := newMemoryStore()
-	ctx := context.Background()
-
-	got, err := store.AcquireLock(ctx, "task-4", time.Minute)
-	if err != nil {
-		t.Fatalf("AcquireLock (first): %v", err)
-	}
-	if !got {
-		t.Error("expected lock acquired on first call")
-	}
-
-	got, err = store.AcquireLock(ctx, "task-4", time.Minute)
-	if err != nil {
-		t.Fatalf("AcquireLock (second): %v", err)
-	}
-	if got {
-		t.Error("expected lock denied on second call")
 	}
 }

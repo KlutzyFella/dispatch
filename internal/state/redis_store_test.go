@@ -177,30 +177,3 @@ func TestRedisStore_GetTask_CorruptField(t *testing.T) {
 		t.Fatal("expected error for corrupt field, got nil")
 	}
 }
-
-func TestRedisStore_AcquireLock(t *testing.T) {
-	t.Parallel()
-
-	client := newTestRedisClient(t)
-	store := state.NewRedisTaskStore(client)
-	ctx := context.Background()
-
-	taskID := "lock-test-" + t.Name()
-	t.Cleanup(func() { client.Del(ctx, "lock:task:"+taskID) })
-
-	got, err := store.AcquireLock(ctx, taskID, 5*time.Second)
-	if err != nil {
-		t.Fatalf("AcquireLock (first): %v", err)
-	}
-	if !got {
-		t.Error("expected lock acquired on first call")
-	}
-
-	got, err = store.AcquireLock(ctx, taskID, 5*time.Second)
-	if err != nil {
-		t.Fatalf("AcquireLock (second): %v", err)
-	}
-	if got {
-		t.Error("expected lock denied on second call (already held)")
-	}
-}

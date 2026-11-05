@@ -22,8 +22,6 @@ spec:
             - name: metrics
               containerPort: 9091
           env:
-            - name: REDIS_ADDR
-              value: "redis.default.svc.cluster.local:6379"
             - name: KAFKA_BROKER
               value: "kafka.default.svc.cluster.local:9092"
             - name: GRPC_SERVER_ADDR

@@ -14,19 +14,10 @@ import (
 	"github.com/ronnitchopra/dispatch/internal/metrics"
 )
 
-const lockTTL = 5 * time.Minute
-
 // ProgressSender is the interface the Consumer uses to report task progress.
 // It is satisfied by *ProgressReporter and can be mocked in tests.
 type ProgressSender interface {
 	SendUpdate(update *taskv1.ProgressUpdate) (*taskv1.ProgressAck, error)
-}
-
-// TaskLocker is the subset of the state.TaskStore interface needed by the
-// worker. It is defined locally so the worker package does not import state.
-// *state.RedisTaskStore satisfies this interface implicitly.
-type TaskLocker interface {
-	AcquireLock(ctx context.Context, taskID string, ttl time.Duration) (bool, error)
 }
 
 // DLQPublisher publishes exhausted tasks to the dead-letter queue.
@@ -47,7 +38,6 @@ type messageReader interface {
 type Consumer struct {
 	reader         messageReader
 	reporter       ProgressSender
-	locker         TaskLocker
 	dlqPublisher   DLQPublisher
 	failureDecider func() bool // returns true to simulate task failure
 	workerID       string
@@ -55,11 +45,10 @@ type Consumer struct {
 }
 
 // NewConsumer creates a Consumer backed by a segmentio/kafka-go Reader.
-// locker and dlqPublisher may be nil (locking and DLQ are skipped when nil).
+// dlqPublisher may be nil (DLQ publication is skipped when nil).
 func NewConsumer(
 	brokerAddr, topic, groupID, workerID string,
 	reporter ProgressSender,
-	locker TaskLocker,
 	dlqPublisher DLQPublisher,
 	logger *slog.Logger,
 ) *Consumer {
@@ -74,7 +63,6 @@ func NewConsumer(
 	return &Consumer{
 		reader:         reader,
 		reporter:       reporter,
-		locker:         locker,
 		dlqPublisher:   dlqPublisher,
 		failureDecider: func() bool { return rand.Float64() < 0.10 },
 		workerID:       workerID,
@@ -83,8 +71,8 @@ func NewConsumer(
 }
 
 // Run starts the consumption loop, blocking until ctx is cancelled or processing fails.
-// For each message it deserialises the task, acquires a distributed lock,
-// processes it (with simulated 10% failure), and commits the offset when
+// For each message it deserialises and processes the task (with simulated 10%
+// failure), and commits the offset when
 // processMessage reports that the message was handled.
 // On processing failure the caller must close this consumer. A new reader can
 // replay uncommitted work from the consumer group's committed offset.
@@ -127,25 +115,9 @@ func (c *Consumer) Run(ctx context.Context) error {
 func (c *Consumer) processMessage(ctx context.Context, key, value []byte) error {
 	taskID := string(key)
 
-	// 1. Acquire distributed lock before processing.
-	if c.locker != nil {
-		acquired, err := c.locker.AcquireLock(ctx, taskID, lockTTL)
-		if err != nil {
-			return fmt.Errorf("acquiring lock for task %q: %w", taskID, err)
-		}
-		if !acquired {
-			c.logger.Info("lock not acquired — skipping task (another worker has it)",
-				slog.String("task_id", taskID),
-				slog.String("worker_id", c.workerID),
-			)
-			// Return nil so the offset is committed; another worker owns this task.
-			return nil
-		}
-	}
-
 	start := time.Now()
 
-	// 2. Deserialise the task payload.
+	// 1. Deserialise the task payload.
 	var task taskv1.Task
 	if err := proto.Unmarshal(value, &task); err != nil {
 		return fmt.Errorf("unmarshalling task %q: %w", taskID, err)
@@ -157,7 +129,7 @@ func (c *Consumer) processMessage(ctx context.Context, key, value []byte) error 
 		slog.String("worker_id", c.workerID),
 	)
 
-	// 3. Report RUNNING.
+	// 2. Report RUNNING.
 	ack, err := c.reporter.SendUpdate(&taskv1.ProgressUpdate{
 		TaskId:   taskID,
 		WorkerId: c.workerID,
@@ -174,14 +146,14 @@ func (c *Consumer) processMessage(ctx context.Context, key, value []byte) error 
 		)
 	}
 
-	// 4. Simulate work — interruptible by context cancellation.
+	// 3. Simulate work — interruptible by context cancellation.
 	select {
 	case <-time.After(2 * time.Second):
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 
-	// 5. Simulate 10% failure rate.
+	// 4. Simulate 10% failure rate.
 	decider := c.failureDecider
 	if decider == nil {
 		decider = func() bool { return false }
@@ -190,7 +162,7 @@ func (c *Consumer) processMessage(ctx context.Context, key, value []byte) error 
 		return c.handleFailure(ctx, taskID, &task, start)
 	}
 
-	// 6. Report COMPLETED.
+	// 5. Report COMPLETED.
 	ack, err = c.reporter.SendUpdate(&taskv1.ProgressUpdate{
 		TaskId:   taskID,
 		WorkerId: c.workerID,

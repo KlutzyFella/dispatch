@@ -1,6 +1,6 @@
 # Dispatch
 
-**A high-throughput, fault-tolerant distributed task execution engine built in Go.**
+A task-dispatch simulation built with Go, gRPC, Kafka, and Redis.
 
 ![Go](https://img.shields.io/badge/Go-1.23-00ADD8?style=flat&logo=go&logoColor=white)
 ![Kafka](https://img.shields.io/badge/Apache_Kafka-4.1-231F20?style=flat&logo=apache-kafka&logoColor=white)
@@ -23,19 +23,13 @@ Dispatch separates concerns across two independent binaries:
 
 The boundary between these two services is the Kafka topic `tasks.pending`. Neither service is aware of the other's internal state — they communicate exclusively through the message bus and the gRPC progress stream.
 
-### At-Least-Once Delivery → Exactly-Once Execution
+### Delivery and Replay
 
-Kafka provides **at-least-once delivery** semantics by design: in failure scenarios (worker crash, network partition), a message may be redelivered. This is generally desirable for durability, but it means the same task could be dispatched to multiple workers simultaneously.
+Kafka consumer groups resume from committed offsets. The worker stops on processing errors so a later commit cannot pass unresolved work. A new consumer session can fetch that work again.
 
-Dispatch resolves this with a **Redis distributed lock** (`SETNX` with TTL) acquired before any task begins processing:
+Execution can repeat if a worker exits after doing work but before recording completion or committing its offset. There is no exactly-once execution guarantee. Old Redis lock keys do not suppress replay or acknowledge unfinished work.
 
-```
-AcquireLock(ctx, taskID, 5 * time.Minute)
-```
-
-If a worker cannot acquire the lock, it skips the message and commits the offset — the task is already owned by another worker. This converts at-least-once delivery into **effectively-once execution** without requiring Kafka's idempotent producer or exactly-once transaction protocol.
-
-The dispatch server also enforces **idempotent task submission**: clients may supply an `idempotency_key`, and the server returns the original `task_id` for any duplicate submission rather than enqueuing a second copy.
+Sequential submissions sharing an `idempotency_key` return the original `task_id`. Concurrent admission and publication failure recovery remain open issues.
 
 ### Dead-Letter Queue (DLQ) for Poison-Pill Tasks
 
@@ -47,7 +41,7 @@ Dispatch implements a **DLQ via a second Kafka topic** (`tasks.dead_letter`). Ea
 2. If `max_retries >= 0`, the worker exits with an error without committing this message. Kafka does not rewind the running reader when a commit is skipped; a new consumer session starts from the group's committed offset.
 3. If `max_retries < 0`, the worker attempts to publish the task to `tasks.dead_letter` and treats the message as handled.
 
-Retry accounting across restarts, replay of held Redis locks, and propagation of DLQ publication failures remain incomplete. The current implementation does not guarantee loss-free quarantine or automatic recovery.
+Retry accounting across restarts and propagation of DLQ publication failures remain incomplete. The current implementation does not guarantee loss-free quarantine or automatic recovery.
 
 ### Offset Management as a Reliability Guarantee
 
@@ -66,7 +60,7 @@ The worker closes its reader and exits nonzero on that error. This prevents a la
 
 - **Go 1.23** — statically compiled, single-binary services with structured logging via `log/slog`
 - **Apache Kafka 4.1** — durable, ordered message log for task queuing and DLQ
-- **Redis 7.2** — task state store and distributed lock backend (`SETNX` / `SET NX PX`)
+- **Redis 7.2** — task state store
 - **gRPC + Protobuf** — typed, bidirectional streaming API between dispatch server and workers
 - **Prometheus + Grafana** — metrics collection and dashboarding
 - **Docker + Kubernetes** — multi-stage container builds, Deployments, Services, and HPA
@@ -185,7 +179,7 @@ kubectl apply -f k8s/
 | `dispatch-worker.yaml` | Deployment | 2 replicas, 100m CPU / 128Mi, connects to dispatch-server via cluster DNS |
 | `worker-hpa.yaml` | HorizontalPodAutoscaler | Scales workers 2–10 replicas at 70% CPU utilization |
 
-Workers autoscale horizontally under load. Because execution is gated by Redis distributed locks, adding replicas increases throughput linearly without the risk of duplicate task execution.
+The HPA requests CPU-based worker scaling. Cluster deployment and scaling behavior have not been verified.
 
 ---
 
@@ -204,7 +198,7 @@ Workers autoscale horizontally under load. Because execution is gated by Redis d
 │   ├── broker/                 # Kafka producer abstraction
 │   ├── metrics/                # Prometheus metric definitions
 │   ├── server/                 # gRPC DispatchService implementation
-│   ├── state/                  # Redis task store + distributed lock
+│   ├── state/                  # Redis task store
 │   └── worker/                 # Kafka consumer, progress reporter
 ├── k8s/                        # Kubernetes manifests
 ├── proto/task/v1/task.proto    # Protobuf service definition

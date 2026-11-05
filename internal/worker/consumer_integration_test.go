@@ -11,6 +11,8 @@ import (
 	"time"
 
 	taskv1 "github.com/ronnitchopra/dispatch/gen/task/v1"
+	"github.com/ronnitchopra/dispatch/internal/broker"
+	"github.com/ronnitchopra/dispatch/internal/state"
 	"github.com/ronnitchopra/dispatch/internal/testutil"
 	"github.com/segmentio/kafka-go"
 )
@@ -22,6 +24,59 @@ type observedKafkaReader struct {
 	cancel    context.CancelFunc
 	fetched   []kafka.Message
 	committed []int64
+}
+
+func TestConsumer_Run_ReplaysInterruptedTaskWithLegacyLock(t *testing.T) {
+	addr, topic := testutil.KafkaTopic(t)
+	client := testutil.RedisClient(t)
+	store := state.NewRedisTaskStore(client)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	id := topic
+	t.Cleanup(func() { client.Del(context.Background(), "task:"+id, "lock:task:"+id) })
+	if err := store.SaveTask(ctx, state.TaskRecord{ID: id, TaskType: "simulation", MaxRetries: 1, Status: 1,
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	publisher := broker.NewKafkaProducer(addr, topic, logger)
+	defer publisher.Close()
+	if err := testutil.RetryKafkaMetadata(ctx, func() error {
+		return publisher.Publish(ctx, id, &taskv1.Task{Type: "simulation", MaxRetries: 1})
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	reportErr := errors.New("interrupted before work")
+	first := NewConsumer(addr, topic, topic, "first-worker", &mockSender{err: reportErr}, nil, logger)
+	if err := first.Run(ctx); !errors.Is(err, reportErr) {
+		first.Close()
+		t.Fatalf("first run must leave interrupted work uncommitted, got %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Preserve the exact stale key produced by older workers, including when the
+	// new implementation no longer creates it on the first interrupted attempt.
+	if err := client.Set(ctx, "lock:task:"+id, 1, 5*time.Minute).Err(); err != nil {
+		t.Fatal(err)
+	}
+	sender := &mockSender{}
+	second := NewConsumer(addr, topic, topic, "second-worker", sender, nil, logger)
+	defer second.Close()
+	second.failureDecider = func() bool { return false }
+	reader := &observedKafkaReader{Reader: second.reader.(*kafka.Reader), cancel: cancel}
+	second.reader = reader
+	if err := second.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("replayed task: updates=%d commits=%v", sender.callCount, reader.committed)
+	if sender.callCount != 2 || sender.updates[1].GetStatus() != taskv1.TaskStatus_TASK_STATUS_COMPLETED {
+		t.Fatalf("unfinished task was acknowledged without execution: updates=%v commits=%v", sender.updates, reader.committed)
+	}
+	if len(reader.committed) != 1 || reader.committed[0] != 0 {
+		t.Fatalf("expected completed replay to commit offset 0, got %v", reader.committed)
+	}
 }
 
 func (r *observedKafkaReader) FetchMessage(ctx context.Context) (kafka.Message, error) {
@@ -77,9 +132,9 @@ func TestConsumer_Run_UnhandledMessageRemainsReplayable(t *testing.T) {
 			}
 
 			sender := &mockSender{err: tc.reportErr, errOnCall: 1}
-			// Isolate offset handling from the separately identified Redis lock and
-			// retry-budget defects. Processing and all Kafka operations remain real.
-			consumer := NewConsumer(addr, topic, topic, "test-worker", sender, nil,
+			// Isolate offset handling from retry-budget defects. Processing and
+			// all Kafka operations remain real.
+			consumer := NewConsumer(addr, topic, topic, "test-worker", sender,
 				&mockDLQPublisher{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 			attempts := 0
 			consumer.failureDecider = func() bool {

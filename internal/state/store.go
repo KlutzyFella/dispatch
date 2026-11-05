@@ -25,7 +25,7 @@ type TaskRecord struct {
 	UpdatedAt  time.Time
 }
 
-// TaskStore defines the persistence operations required by the dispatch server and worker.
+// TaskStore defines the persistence operations required by the dispatch server.
 // All implementations must be safe for concurrent use.
 type TaskStore interface {
 	// SaveTask persists a new task record. It must be idempotent — calling
@@ -41,9 +41,4 @@ type TaskStore interface {
 
 	// DeleteTask removes the task record. It is a no-op if the task does not exist.
 	DeleteTask(ctx context.Context, taskID string) error
-
-	// AcquireLock attempts to atomically acquire an exclusive lock for the given
-	// taskID with the specified TTL. Returns true if the lock was acquired, false
-	// if another holder already owns it.
-	AcquireLock(ctx context.Context, taskID string, ttl time.Duration) (bool, error)
 }

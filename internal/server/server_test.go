@@ -98,10 +98,6 @@ func (m *mockTaskStore) DeleteTask(_ context.Context, taskID string) error {
 	return nil
 }
 
-func (m *mockTaskStore) AcquireLock(_ context.Context, _ string, _ time.Duration) (bool, error) {
-	return true, nil
-}
-
 var _ state.TaskStore = (*mockTaskStore)(nil)
 
 // ── Test helpers ──────────────────────────────────────────────────────────────

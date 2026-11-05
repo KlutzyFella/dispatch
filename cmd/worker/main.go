@@ -9,11 +9,9 @@ import (
 	"syscall"
 
 	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
 
 	"github.com/ronnitchopra/dispatch/internal/broker"
 	"github.com/ronnitchopra/dispatch/internal/metrics"
-	"github.com/ronnitchopra/dispatch/internal/state"
 	"github.com/ronnitchopra/dispatch/internal/worker"
 )
 
@@ -23,13 +21,11 @@ const (
 	defaultKafkaTopic   = "tasks.pending"
 	defaultDLQTopic     = "tasks.dead_letter"
 	defaultGRPCAddr     = "localhost:50051"
-	defaultRedisAddr    = "localhost:6379"
 	defaultMetricsPort  = "9091"
 
 	envKafkaBroker  = "KAFKA_BROKER"
 	envKafkaGroupID = "KAFKA_GROUP_ID"
 	envGRPCAddr     = "GRPC_SERVER_ADDR"
-	envRedisAddr    = "REDIS_ADDR"
 	envMetricsPort  = "METRICS_PORT"
 )
 
@@ -47,7 +43,6 @@ func run(logger *slog.Logger) error {
 	kafkaBroker := envOrDefault(envKafkaBroker, defaultKafkaBroker)
 	groupID := envOrDefault(envKafkaGroupID, defaultKafkaGroupID)
 	grpcAddr := envOrDefault(envGRPCAddr, defaultGRPCAddr)
-	redisAddr := envOrDefault(envRedisAddr, defaultRedisAddr)
 
 	workerID := uuid.NewString()
 
@@ -56,26 +51,10 @@ func run(logger *slog.Logger) error {
 		slog.String("kafka_broker", kafkaBroker),
 		slog.String("group_id", groupID),
 		slog.String("grpc_addr", grpcAddr),
-		slog.String("redis_addr", redisAddr),
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
-	// ── Redis ──────────────────────────────────────────────────────────────────
-	redisClient := redis.NewClient(&redis.Options{Addr: redisAddr})
-	defer func() {
-		if err := redisClient.Close(); err != nil {
-			logger.Error("redis client close error", slog.String("error", err.Error()))
-		}
-	}()
-
-	if err := redisClient.Ping(ctx).Err(); err != nil {
-		return fmt.Errorf("connecting to Redis at %s: %w", redisAddr, err)
-	}
-	logger.Info("redis connected", slog.String("addr", redisAddr))
-
-	locker := state.NewRedisTaskStore(redisClient)
 
 	// ── gRPC progress reporter ─────────────────────────────────────────────────
 	reporter, err := worker.NewProgressReporter(ctx, grpcAddr, logger)
@@ -103,7 +82,7 @@ func run(logger *slog.Logger) error {
 	// ── Kafka consumer ─────────────────────────────────────────────────────────
 	consumer := worker.NewConsumer(
 		kafkaBroker, defaultKafkaTopic, groupID, workerID,
-		reporter, locker, dlqProducer,
+		reporter, dlqProducer,
 		logger,
 	)
 	defer func() {

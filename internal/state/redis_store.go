@@ -9,13 +9,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const (
-	taskKeyPrefix = "task:"
-	lockKeyPrefix = "lock:task:"
-)
+const taskKeyPrefix = "task:"
 
-// RedisTaskStore implements TaskStore using Redis hashes for task records and
-// SETNX-based distributed locking.
+// RedisTaskStore implements TaskStore using Redis hashes for task records.
 type RedisTaskStore struct {
 	client *redis.Client
 }
@@ -90,17 +86,6 @@ func (s *RedisTaskStore) DeleteTask(ctx context.Context, taskID string) error {
 		return fmt.Errorf("deleting task %q: %w", taskID, err)
 	}
 	return nil
-}
-
-// AcquireLock uses SetNX on "lock:task:{id}" with the given TTL.
-// Returns true if the lock was acquired, false if it was already held.
-func (s *RedisTaskStore) AcquireLock(ctx context.Context, taskID string, ttl time.Duration) (bool, error) {
-	key := lockKeyPrefix + taskID
-	ok, err := s.client.SetNX(ctx, key, 1, ttl).Result()
-	if err != nil {
-		return false, fmt.Errorf("acquiring lock for task %q: %w", taskID, err)
-	}
-	return ok, nil
 }
 
 // parseRecord converts a Redis hash map into a TaskRecord.
