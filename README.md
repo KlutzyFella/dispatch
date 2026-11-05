@@ -21,13 +21,13 @@ Dispatch separates concerns across two independent binaries:
 - **`cmd/dispatch`** — the Ingestion API. A gRPC server that accepts task submissions, performs idempotency checks, persists state to Redis, and publishes serialized tasks (Protobuf) to a Kafka topic. It never executes tasks; its only job is to accept work reliably.
 - **`cmd/worker`** — the Worker Pool. Independently scalable consumers that read from Kafka, execute tasks, and stream progress updates back to the dispatch server via a long-lived bidirectional gRPC stream (`ReportProgress`). One stream handles multiple task updates, avoiding connection-per-task overhead.
 
-The boundary between these two services is the Kafka topic `tasks.pending`. Neither service is aware of the other's internal state — they communicate exclusively through the message bus and the gRPC progress stream.
+Tasks travel through the Kafka topic `tasks.pending`. Both services use Redis task records; workers report progress over the gRPC stream and reserve execution attempts in Redis.
 
 ### Delivery and Replay
 
 Kafka consumer groups resume from committed offsets. The worker stops on processing errors so a later commit cannot pass unresolved work. A new consumer session can fetch that work again.
 
-Execution can repeat if a worker exits after doing work but before recording completion or committing its offset. There is no exactly-once execution guarantee. Old Redis lock keys do not suppress replay or acknowledge unfinished work.
+Execution can repeat if a worker exits after doing work but before recording completion. Replayed tasks already recorded COMPLETED are acknowledged without another execution. There is no exactly-once execution guarantee. Old Redis lock keys do not suppress replay or acknowledge unfinished work.
 
 Sequential submissions sharing an `idempotency_key` return the original `task_id`. Concurrent admission and publication failure recovery remain open issues.
 
@@ -35,13 +35,13 @@ Sequential submissions sharing an `idempotency_key` return the original `task_id
 
 Some tasks will fail regardless of how many times they are retried — malformed payloads, unavailable external dependencies, logic errors. Retrying these indefinitely blocks worker capacity and pollutes metrics.
 
-Dispatch implements a **DLQ via a second Kafka topic** (`tasks.dead_letter`). Each task carries a `max_retries` counter. On failure:
+Dispatch uses a second Kafka topic, `tasks.dead_letter`, for exhausted tasks. `max_retries=N` permits at most **N+1 started attempts per task ID**:
 
-1. `max_retries` is decremented and a `TASK_STATUS_FAILED` progress update is sent upstream.
-2. If `max_retries >= 0`, the worker exits with an error without committing this message. Kafka does not rewind the running reader when a commit is skipped; a new consumer session starts from the group's committed offset.
-3. If `max_retries < 0`, the worker attempts to publish the task to `tasks.dead_letter` and treats the message as handled.
+1. Before RUNNING, a Redis Lua script atomically reserves a start in the task hash's `attempts` field. Missing fields begin at zero; missing task records fail execution rather than being recreated.
+2. A simulated task failure reports FAILED and retries the same message before the reader advances. The original `max_retries` value is not decremented or republished.
+3. An exhausted budget attempts to publish the original task to the DLQ. A restart with an exhausted budget retries quarantine rather than executing another attempt.
 
-Retry accounting across restarts and propagation of DLQ publication failures remain incomplete. The current implementation does not guarantee loss-free quarantine or automatic recovery.
+An interrupted start counts toward the budget, including an interruption before work begins. Attempt accounting survives worker restarts while the Redis record is retained. Redis persistence and retention bound this guarantee; this is not a guarantee against Redis data loss. Propagation of DLQ publication failures remains incomplete.
 
 ### Offset Management as a Reliability Guarantee
 
@@ -60,7 +60,7 @@ The worker closes its reader and exits nonzero on that error. This prevents a la
 
 - **Go 1.23** — statically compiled, single-binary services with structured logging via `log/slog`
 - **Apache Kafka 4.1** — durable, ordered message log for task queuing and DLQ
-- **Redis 7.2** — task state store
+- **Redis 7.2** — task state and atomic started-attempt accounting
 - **gRPC + Protobuf** — typed, bidirectional streaming API between dispatch server and workers
 - **Prometheus + Grafana** — metrics collection and dashboarding
 - **Docker + Kubernetes** — multi-stage container builds, Deployments, Services, and HPA
@@ -140,8 +140,8 @@ Both services expose a `/metrics` endpoint scraped by Prometheus every 15 second
 |---|---|---|
 | `tasks_submitted_total` | Counter | Task submissions, labeled `status=accepted\|rejected` |
 | `tasks_completed_total` | Counter | Successfully executed tasks |
-| `tasks_failed_total` | Counter | Failed executions (includes DLQ sends) |
-| `task_execution_duration_seconds` | Histogram | End-to-end task execution latency |
+| `tasks_failed_total` | Counter | Failed simulated execution attempts |
+| `task_execution_duration_seconds` | Histogram | Per-attempt simulated execution duration; excludes queue wait |
 
 ### Grafana
 
@@ -233,5 +233,7 @@ GOTOOLCHAIN=go1.23.0 go test -tags=integration -count=1 -race ./...
 
 Kafka tests use `localhost:9092` by default, accept `KAFKA_BROKER` as an override,
 and fail when the broker is unavailable. They create uniquely named topics and
-delete those topics at cleanup. Redis tests currently require `localhost:6379`
-and skip when Redis is absent. The commands above provide both services.
+delete those topics at cleanup. Integration-tagged Redis regressions default to
+`localhost:6379`, accept `REDIS_ADDR`, and fail if Redis is absent. Older Redis
+tests in the default suite still use `localhost:6379` and skip if it is absent.
+The commands above provide both services.

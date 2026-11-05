@@ -9,6 +9,7 @@ import (
 	"time"
 
 	taskv1 "github.com/ronnitchopra/dispatch/gen/task/v1"
+	"github.com/ronnitchopra/dispatch/internal/state"
 	"github.com/segmentio/kafka-go"
 	"google.golang.org/protobuf/proto"
 )
@@ -80,6 +81,33 @@ type mockDLQPublisher struct {
 	err       error
 }
 
+// mockAttemptStore supplies attempt reservations for single-consumer unit tests.
+// Atomicity and persistence are tested against Redis, not this fixture.
+type mockAttemptStore struct {
+	counts map[string]int64
+}
+
+func (*mockAttemptStore) GetTask(ctx context.Context, id string) (state.TaskRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return state.TaskRecord{}, err
+	}
+	return state.TaskRecord{ID: id, Status: int32(taskv1.TaskStatus_TASK_STATUS_PENDING)}, nil
+}
+
+func (m *mockAttemptStore) StartAttempt(ctx context.Context, id string, maxAttempts int64) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if m.counts == nil {
+		m.counts = make(map[string]int64)
+	}
+	if m.counts[id] >= maxAttempts {
+		return 0, nil
+	}
+	m.counts[id]++
+	return m.counts[id], nil
+}
+
 func (m *mockDLQPublisher) Publish(_ context.Context, taskID string, _ *taskv1.Task) error {
 	if m.err != nil {
 		return m.err
@@ -95,6 +123,7 @@ func (m *mockDLQPublisher) Publish(_ context.Context, taskID string, _ *taskv1.T
 func newTestConsumer(sender ProgressSender) *Consumer {
 	return &Consumer{
 		reporter:       sender,
+		attempts:       &mockAttemptStore{},
 		failureDecider: func() bool { return false },
 		workerID:       "test-worker",
 		logger:         slog.New(slog.NewTextHandler(os.Stderr, nil)),
@@ -214,34 +243,43 @@ func TestProcessMessage_ReporterFailsOnRunning(t *testing.T) {
 
 // ── processMessage: failure / DLQ ─────────────────────────────────────────────
 
-func TestProcessMessage_FailureWithRetriesRemaining(t *testing.T) {
+func TestProcessMessage_RetriesBeforeAdvancing(t *testing.T) {
 	t.Parallel()
-
 	sender := &mockSender{}
 	dlq := &mockDLQPublisher{}
 	c := newTestConsumer(sender)
 	c.dlqPublisher = dlq
-	c.failureDecider = func() bool { return true } // always fail
-
-	task := &taskv1.Task{Type: "email", MaxRetries: 2}
-	payload := marshalTask(t, task)
-
-	err := c.processMessage(context.Background(), []byte("task-retry"), payload)
-	if err == nil {
-		t.Fatal("expected error so offset is not committed, got nil")
+	attempts := 0
+	c.failureDecider = func() bool { attempts++; return attempts == 1 }
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := c.processMessage(ctx, []byte("retry-then-success"), marshalTask(t, &taskv1.Task{Type: "simulation", MaxRetries: 1}))
+	if err != nil {
+		t.Errorf("a retryable task failure should be resolved before returning, got %v", err)
 	}
-
-	// Should have sent RUNNING then FAILED.
-	if sender.callCount != 2 {
-		t.Fatalf("expected 2 SendUpdate calls (RUNNING + FAILED), got %d", sender.callCount)
+	if attempts != 2 || sender.callCount != 4 || len(dlq.published) != 0 {
+		t.Fatalf("attempts=%d updates=%v DLQ=%v; want failed attempt then successful retry", attempts, sender.updates, dlq.published)
 	}
-	if sender.updates[1].GetStatus() != taskv1.TaskStatus_TASK_STATUS_FAILED {
-		t.Errorf("second update should be FAILED, got %s", sender.updates[1].GetStatus())
+	if sender.updates[1].GetStatus() != taskv1.TaskStatus_TASK_STATUS_FAILED || sender.updates[3].GetStatus() != taskv1.TaskStatus_TASK_STATUS_COMPLETED {
+		t.Errorf("unexpected retry lifecycle: %v", sender.updates)
 	}
+}
 
-	// DLQ must NOT be called — retries remain.
-	if len(dlq.published) != 0 {
-		t.Errorf("DLQ should not be called when retries remain, got %d calls", len(dlq.published))
+func TestProcessMessage_ExhaustsConfiguredRetryBudget(t *testing.T) {
+	t.Parallel()
+	dlq := &mockDLQPublisher{}
+	c := newTestConsumer(&mockSender{})
+	c.dlqPublisher = dlq
+	attempts := 0
+	c.failureDecider = func() bool { attempts++; return true }
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	err := c.processMessage(ctx, []byte("exhaust-retries"), marshalTask(t, &taskv1.Task{Type: "simulation", MaxRetries: 2}))
+	if err != nil {
+		t.Errorf("exhausted task should be quarantined, got %v", err)
+	}
+	if attempts != 3 || len(dlq.published) != 1 {
+		t.Fatalf("attempts=%d DLQ=%v; max_retries=2 must allow three attempts then quarantine", attempts, dlq.published)
 	}
 }
 
@@ -254,7 +292,7 @@ func TestProcessMessage_FailureSendsToDLQ(t *testing.T) {
 	c.dlqPublisher = dlq
 	c.failureDecider = func() bool { return true }
 
-	// MaxRetries=0 → after one failure, MaxRetries becomes -1 → send to DLQ.
+	// MaxRetries=0 allows one started attempt before quarantine.
 	task := &taskv1.Task{Type: "email", MaxRetries: 0}
 	payload := marshalTask(t, task)
 
@@ -311,7 +349,7 @@ func TestNewConsumer_InitialisesFields(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	c := NewConsumer("localhost:9092", "tasks.pending", "dispatch-workers", "w-1",
-		sender, dlq, logger)
+		sender, &mockAttemptStore{}, dlq, logger)
 	if c == nil {
 		t.Fatal("expected non-nil Consumer")
 	}

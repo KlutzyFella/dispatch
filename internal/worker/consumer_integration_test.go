@@ -48,7 +48,7 @@ func TestConsumer_Run_ReplaysInterruptedTaskWithLegacyLock(t *testing.T) {
 	}
 
 	reportErr := errors.New("interrupted before work")
-	first := NewConsumer(addr, topic, topic, "first-worker", &mockSender{err: reportErr}, nil, logger)
+	first := NewConsumer(addr, topic, topic, "first-worker", &mockSender{err: reportErr}, store, nil, logger)
 	if err := first.Run(ctx); !errors.Is(err, reportErr) {
 		first.Close()
 		t.Fatalf("first run must leave interrupted work uncommitted, got %v", err)
@@ -62,7 +62,7 @@ func TestConsumer_Run_ReplaysInterruptedTaskWithLegacyLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	sender := &mockSender{}
-	second := NewConsumer(addr, topic, topic, "second-worker", sender, nil, logger)
+	second := NewConsumer(addr, topic, topic, "second-worker", sender, store, nil, logger)
 	defer second.Close()
 	second.failureDecider = func() bool { return false }
 	reader := &observedKafkaReader{Reader: second.reader.(*kafka.Reader), cancel: cancel}
@@ -104,11 +104,9 @@ func TestConsumer_Run_UnhandledMessageRemainsReplayable(t *testing.T) {
 	tests := []struct {
 		name      string
 		body      []byte
-		failTask  bool
 		reportErr error
 	}{
 		{name: "corrupt_protobuf", body: []byte("not-protobuf")},
-		{name: "task_failure", body: valid, failTask: true},
 		{name: "progress_failure", body: valid, reportErr: reportErr},
 	}
 	for _, tc := range tests {
@@ -132,15 +130,11 @@ func TestConsumer_Run_UnhandledMessageRemainsReplayable(t *testing.T) {
 			}
 
 			sender := &mockSender{err: tc.reportErr, errOnCall: 1}
-			// Isolate offset handling from retry-budget defects. Processing and
-			// all Kafka operations remain real.
-			consumer := NewConsumer(addr, topic, topic, "test-worker", sender,
+			// Real Redis budget/restart behavior has its own integration regression.
+			// These cases isolate the Kafka response to transport/decoding errors.
+			consumer := NewConsumer(addr, topic, topic, "test-worker", sender, &mockAttemptStore{},
 				&mockDLQPublisher{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-			attempts := 0
-			consumer.failureDecider = func() bool {
-				attempts++
-				return tc.failTask && attempts == 1
-			}
+			consumer.failureDecider = func() bool { return false }
 			reader := &observedKafkaReader{Reader: consumer.reader.(*kafka.Reader), cancel: cancel}
 			consumer.reader = reader
 			defer consumer.Close()

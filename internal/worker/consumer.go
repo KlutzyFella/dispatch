@@ -12,12 +12,19 @@ import (
 
 	taskv1 "github.com/ronnitchopra/dispatch/gen/task/v1"
 	"github.com/ronnitchopra/dispatch/internal/metrics"
+	"github.com/ronnitchopra/dispatch/internal/state"
 )
 
 // ProgressSender is the interface the Consumer uses to report task progress.
 // It is satisfied by *ProgressReporter and can be mocked in tests.
 type ProgressSender interface {
 	SendUpdate(update *taskv1.ProgressUpdate) (*taskv1.ProgressAck, error)
+}
+
+// AttemptStore persists started-attempt counts across consumer restarts.
+type AttemptStore interface {
+	GetTask(ctx context.Context, taskID string) (state.TaskRecord, error)
+	StartAttempt(ctx context.Context, taskID string, maxAttempts int64) (int64, error)
 }
 
 // DLQPublisher publishes exhausted tasks to the dead-letter queue.
@@ -38,6 +45,7 @@ type messageReader interface {
 type Consumer struct {
 	reader         messageReader
 	reporter       ProgressSender
+	attempts       AttemptStore
 	dlqPublisher   DLQPublisher
 	failureDecider func() bool // returns true to simulate task failure
 	workerID       string
@@ -45,10 +53,12 @@ type Consumer struct {
 }
 
 // NewConsumer creates a Consumer backed by a segmentio/kafka-go Reader.
+// attempts must persist reservations across reader/worker restarts.
 // dlqPublisher may be nil (DLQ publication is skipped when nil).
 func NewConsumer(
 	brokerAddr, topic, groupID, workerID string,
 	reporter ProgressSender,
+	attempts AttemptStore,
 	dlqPublisher DLQPublisher,
 	logger *slog.Logger,
 ) *Consumer {
@@ -63,6 +73,7 @@ func NewConsumer(
 	return &Consumer{
 		reader:         reader,
 		reporter:       reporter,
+		attempts:       attempts,
 		dlqPublisher:   dlqPublisher,
 		failureDecider: func() bool { return rand.Float64() < 0.10 },
 		workerID:       workerID,
@@ -71,9 +82,8 @@ func NewConsumer(
 }
 
 // Run starts the consumption loop, blocking until ctx is cancelled or processing fails.
-// For each message it deserialises and processes the task (with simulated 10%
-// failure), and commits the offset when
-// processMessage reports that the message was handled.
+// It retries simulated task failures within the durable started-attempt budget
+// and commits when processMessage reports that the message was handled.
 // On processing failure the caller must close this consumer. A new reader can
 // replay uncommitted work from the consumer group's committed offset.
 func (c *Consumer) Run(ctx context.Context) error {
@@ -114,13 +124,19 @@ func (c *Consumer) Run(ctx context.Context) error {
 // processMessage is the per-message execution logic, extracted for testability.
 func (c *Consumer) processMessage(ctx context.Context, key, value []byte) error {
 	taskID := string(key)
-
-	start := time.Now()
-
-	// 1. Deserialise the task payload.
 	var task taskv1.Task
 	if err := proto.Unmarshal(value, &task); err != nil {
 		return fmt.Errorf("unmarshalling task %q: %w", taskID, err)
+	}
+	if c.attempts == nil {
+		return fmt.Errorf("attempt store is not configured")
+	}
+	record, err := c.attempts.GetTask(ctx, taskID)
+	if err != nil {
+		return fmt.Errorf("reading task %q before execution: %w", taskID, err)
+	}
+	if record.Status == int32(taskv1.TaskStatus_TASK_STATUS_COMPLETED) {
+		return nil
 	}
 
 	c.logger.Info("task received",
@@ -128,8 +144,49 @@ func (c *Consumer) processMessage(ctx context.Context, key, value []byte) error 
 		slog.String("type", task.GetType()),
 		slog.String("worker_id", c.workerID),
 	)
+	maxAttempts := int64(task.GetMaxRetries()) + 1
+	for {
+		attempt, err := c.attempts.StartAttempt(ctx, taskID, maxAttempts)
+		if err != nil {
+			return fmt.Errorf("recording attempt for task %q: %w", taskID, err)
+		}
+		if attempt == 0 {
+			// Completion may have been recorded by another worker during a replay.
+			record, err := c.attempts.GetTask(ctx, taskID)
+			if err != nil {
+				return fmt.Errorf("checking exhausted task %q: %w", taskID, err)
+			}
+			if record.Status == int32(taskv1.TaskStatus_TASK_STATUS_COMPLETED) {
+				return nil
+			}
+			if record.Status != int32(taskv1.TaskStatus_TASK_STATUS_FAILED) {
+				if _, err := c.reporter.SendUpdate(&taskv1.ProgressUpdate{
+					TaskId: taskID, WorkerId: c.workerID,
+					Status: taskv1.TaskStatus_TASK_STATUS_FAILED,
+				}); err != nil {
+					return fmt.Errorf("reporting exhausted task %q: %w", taskID, err)
+				}
+			}
+			return c.publishDeadLetter(ctx, taskID, &task)
+		}
+		c.logger.Info("task attempt started", slog.String("task_id", taskID),
+			slog.Int64("attempt", attempt), slog.Int64("max_attempts", maxAttempts))
+		failed, err := c.processAttempt(ctx, taskID)
+		if err != nil {
+			return err
+		}
+		if !failed {
+			return nil
+		}
+	}
+}
 
-	// 2. Report RUNNING.
+// processAttempt reports one simulated execution. Infrastructure errors stop
+// processing; a simulated task failure is retried within the persisted budget.
+func (c *Consumer) processAttempt(ctx context.Context, taskID string) (bool, error) {
+	start := time.Now()
+
+	// Report RUNNING.
 	ack, err := c.reporter.SendUpdate(&taskv1.ProgressUpdate{
 		TaskId:   taskID,
 		WorkerId: c.workerID,
@@ -137,7 +194,7 @@ func (c *Consumer) processMessage(ctx context.Context, key, value []byte) error 
 		Progress: 0,
 	})
 	if err != nil {
-		return fmt.Errorf("sending RUNNING update for task %q: %w", taskID, err)
+		return false, fmt.Errorf("sending RUNNING update for task %q: %w", taskID, err)
 	}
 	if !ack.GetRecorded() {
 		c.logger.Warn("RUNNING update not recorded by server",
@@ -146,23 +203,24 @@ func (c *Consumer) processMessage(ctx context.Context, key, value []byte) error 
 		)
 	}
 
-	// 3. Simulate work — interruptible by context cancellation.
+	// Simulate work — interruptible by context cancellation.
 	select {
 	case <-time.After(2 * time.Second):
 	case <-ctx.Done():
-		return ctx.Err()
+		return false, ctx.Err()
 	}
 
-	// 4. Simulate 10% failure rate.
+	// Simulate 10% failure rate.
 	decider := c.failureDecider
 	if decider == nil {
 		decider = func() bool { return false }
 	}
 	if decider() {
-		return c.handleFailure(ctx, taskID, &task, start)
+		c.handleFailure(ctx, taskID, start)
+		return true, nil
 	}
 
-	// 5. Report COMPLETED.
+	// Report COMPLETED.
 	ack, err = c.reporter.SendUpdate(&taskv1.ProgressUpdate{
 		TaskId:   taskID,
 		WorkerId: c.workerID,
@@ -170,7 +228,7 @@ func (c *Consumer) processMessage(ctx context.Context, key, value []byte) error 
 		Progress: 100,
 	})
 	if err != nil {
-		return fmt.Errorf("sending COMPLETED update for task %q: %w", taskID, err)
+		return false, fmt.Errorf("sending COMPLETED update for task %q: %w", taskID, err)
 	}
 	if !ack.GetRecorded() {
 		c.logger.Warn("COMPLETED update not recorded by server",
@@ -187,22 +245,18 @@ func (c *Consumer) processMessage(ctx context.Context, key, value []byte) error 
 		slog.String("worker_id", c.workerID),
 	)
 
-	return nil
+	return false, nil
 }
 
-// handleFailure processes a simulated task failure. It decrements max_retries
-// and either sends the task to the DLQ (retries exhausted) or returns an error
-// so Run stops without committing the Kafka offset.
-func (c *Consumer) handleFailure(ctx context.Context, taskID string, task *taskv1.Task, start time.Time) error {
-	task.MaxRetries--
-
+// handleFailure records a simulated failed attempt without mutating the task's
+// configured retry budget or acknowledging its Kafka message.
+func (c *Consumer) handleFailure(ctx context.Context, taskID string, start time.Time) {
 	metrics.TasksFailedTotal.Inc()
 	metrics.TaskExecutionDuration.Observe(time.Since(start).Seconds())
 
 	c.logger.Warn("task failed",
 		slog.String("task_id", taskID),
 		slog.String("worker_id", c.workerID),
-		slog.Int("retries_remaining", int(task.GetMaxRetries())),
 	)
 
 	// Always report FAILED status.
@@ -217,27 +271,17 @@ func (c *Consumer) handleFailure(ctx context.Context, taskID string, task *taskv
 			slog.String("error", err.Error()),
 		)
 	}
+}
 
-	if task.GetMaxRetries() < 0 {
-		// Retries exhausted — publish to dead-letter queue and commit offset.
-		c.logger.Error("task exhausted all retries — sending to DLQ",
-			slog.String("task_id", taskID),
-			slog.String("worker_id", c.workerID),
-		)
-		if c.dlqPublisher != nil {
-			if err := c.dlqPublisher.Publish(ctx, taskID, task); err != nil {
-				c.logger.Error("failed to publish task to DLQ",
-					slog.String("task_id", taskID),
-					slog.String("error", err.Error()),
-				)
-			}
+func (c *Consumer) publishDeadLetter(ctx context.Context, taskID string, task *taskv1.Task) error {
+	c.logger.Error("task exhausted all retries — sending to DLQ",
+		slog.String("task_id", taskID), slog.String("worker_id", c.workerID))
+	if c.dlqPublisher != nil {
+		if err := c.dlqPublisher.Publish(ctx, taskID, task); err != nil {
+			c.logger.Error("failed to publish task to DLQ", slog.String("task_id", taskID), slog.String("error", err.Error()))
 		}
-		// Return nil so the offset IS committed (task is dead-lettered).
-		return nil
 	}
-
-	// Retries remain — stop consumption before a later commit can pass this task.
-	return fmt.Errorf("task %q failed, %d retries remaining", taskID, task.GetMaxRetries())
+	return nil
 }
 
 // Close releases the underlying Kafka reader.
