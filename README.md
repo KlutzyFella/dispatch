@@ -33,15 +33,15 @@ Sequential submissions sharing an `idempotency_key` return the original `task_id
 
 ### Dead-Letter Queue (DLQ) for Poison-Pill Tasks
 
-Some tasks will fail regardless of how many times they are retried — malformed payloads, unavailable external dependencies, logic errors. Retrying these indefinitely blocks worker capacity and pollutes metrics.
+The worker simulates task failures and quarantines exhausted valid task messages. Undecodable protobuf stops the worker without committing; it is not automatically dead-lettered and needs inspection.
 
 Dispatch uses a second Kafka topic, `tasks.dead_letter`, for exhausted tasks. `max_retries=N` permits at most **N+1 started attempts per task ID**:
 
 1. Before RUNNING, a Redis Lua script atomically reserves a start in the task hash's `attempts` field. Missing fields begin at zero; missing task records fail execution rather than being recreated.
 2. A simulated task failure reports FAILED and retries the same message before the reader advances. The original `max_retries` value is not decremented or republished.
-3. An exhausted budget attempts to publish the original task to the DLQ. A restart with an exhausted budget retries quarantine rather than executing another attempt.
+3. An exhausted budget publishes the original task to the DLQ. Only an acknowledged publication counts as handled. A missing publisher or rejected write stops the worker without committing the source message. A restart with an exhausted budget retries quarantine rather than executing another attempt.
 
-An interrupted start counts toward the budget, including an interruption before work begins. Attempt accounting survives worker restarts while the Redis record is retained. Redis persistence and retention bound this guarantee; this is not a guarantee against Redis data loss. Propagation of DLQ publication failures remains incomplete.
+An interrupted start counts toward the budget, including an interruption before work begins. Attempt accounting survives worker restarts while the Redis record is retained. Redis persistence and retention bound this guarantee; this is not a guarantee against Redis data loss. DLQ records may be duplicated if a worker exits after publication but before committing the source offset.
 
 ### Offset Management as a Reliability Guarantee
 

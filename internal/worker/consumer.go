@@ -27,7 +27,8 @@ type AttemptStore interface {
 	StartAttempt(ctx context.Context, taskID string, maxAttempts int64) (int64, error)
 }
 
-// DLQPublisher publishes exhausted tasks to the dead-letter queue.
+// DLQPublisher publishes exhausted tasks to the dead-letter queue. Publish must
+// return broker rejections rather than acknowledge fire-and-forget writes.
 // *broker.KafkaProducer satisfies this interface implicitly.
 type DLQPublisher interface {
 	Publish(ctx context.Context, taskID string, task *taskv1.Task) error
@@ -54,7 +55,7 @@ type Consumer struct {
 
 // NewConsumer creates a Consumer backed by a segmentio/kafka-go Reader.
 // attempts must persist reservations across reader/worker restarts.
-// dlqPublisher may be nil (DLQ publication is skipped when nil).
+// Without a dlqPublisher, exhaustion returns an error and leaves work uncommitted.
 func NewConsumer(
 	brokerAddr, topic, groupID, workerID string,
 	reporter ProgressSender,
@@ -276,10 +277,11 @@ func (c *Consumer) handleFailure(ctx context.Context, taskID string, start time.
 func (c *Consumer) publishDeadLetter(ctx context.Context, taskID string, task *taskv1.Task) error {
 	c.logger.Error("task exhausted all retries — sending to DLQ",
 		slog.String("task_id", taskID), slog.String("worker_id", c.workerID))
-	if c.dlqPublisher != nil {
-		if err := c.dlqPublisher.Publish(ctx, taskID, task); err != nil {
-			c.logger.Error("failed to publish task to DLQ", slog.String("task_id", taskID), slog.String("error", err.Error()))
-		}
+	if c.dlqPublisher == nil {
+		return fmt.Errorf("DLQ publisher is not configured for exhausted task %q", taskID)
+	}
+	if err := c.dlqPublisher.Publish(ctx, taskID, task); err != nil {
+		return fmt.Errorf("publishing task %q to DLQ: %w", taskID, err)
 	}
 	return nil
 }

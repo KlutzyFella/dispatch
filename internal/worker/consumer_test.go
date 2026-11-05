@@ -332,10 +332,21 @@ func TestProcessMessage_FailureNoDLQPublisher(t *testing.T) {
 	task := &taskv1.Task{Type: "email", MaxRetries: 0}
 	payload := marshalTask(t, task)
 
-	// Must not panic; just logs.
 	err := c.processMessage(context.Background(), []byte("task-nodlq"), payload)
-	if err != nil {
-		t.Fatalf("expected nil when DLQ publisher is absent, got %v", err)
+	if err == nil {
+		t.Fatal("missing DLQ publisher must not acknowledge an exhausted task")
+	}
+}
+
+func TestProcessMessage_DLQFailureNotHandled(t *testing.T) {
+	t.Parallel()
+	publishErr := errors.New("DLQ unavailable")
+	c := newTestConsumer(&mockSender{})
+	c.dlqPublisher = &mockDLQPublisher{err: publishErr}
+	c.failureDecider = func() bool { return true }
+	err := c.processMessage(context.Background(), []byte("failed-dlq"), marshalTask(t, &taskv1.Task{Type: "simulation"}))
+	if !errors.Is(err, publishErr) {
+		t.Fatalf("failed quarantine must propagate its cause, got %v", err)
 	}
 }
 
