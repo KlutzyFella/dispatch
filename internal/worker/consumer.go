@@ -82,10 +82,12 @@ func NewConsumer(
 	}
 }
 
-// Run starts the consumption loop, blocking until ctx is cancelled.
+// Run starts the consumption loop, blocking until ctx is cancelled or processing fails.
 // For each message it deserialises the task, acquires a distributed lock,
-// processes it (with simulated 10% failure), and commits the offset only when
-// the message is fully handled or sent to the DLQ.
+// processes it (with simulated 10% failure), and commits the offset when
+// processMessage reports that the message was handled.
+// On processing failure the caller must close this consumer. A new reader can
+// replay uncommitted work from the consumer group's committed offset.
 func (c *Consumer) Run(ctx context.Context) error {
 	c.logger.Info("consumer started",
 		slog.String("worker_id", c.workerID),
@@ -102,11 +104,12 @@ func (c *Consumer) Run(ctx context.Context) error {
 		}
 
 		if err := c.processMessage(ctx, msg.Key, msg.Value); err != nil {
-			c.logger.Error("failed to process message — will not commit offset",
-				slog.String("error", err.Error()),
-			)
-			// Do not commit: the message will be redelivered.
-			continue
+			if ctx.Err() != nil {
+				return nil
+			}
+			// Later commits in this partition would also acknowledge this failure.
+			return fmt.Errorf("processing message from %s[%d] at offset %d: %w",
+				msg.Topic, msg.Partition, msg.Offset, err)
 		}
 
 		if err := c.reader.CommitMessages(ctx, msg); err != nil {
@@ -217,7 +220,7 @@ func (c *Consumer) processMessage(ctx context.Context, key, value []byte) error 
 
 // handleFailure processes a simulated task failure. It decrements max_retries
 // and either sends the task to the DLQ (retries exhausted) or returns an error
-// so the Kafka offset is not committed and the message is redelivered.
+// so Run stops without committing the Kafka offset.
 func (c *Consumer) handleFailure(ctx context.Context, taskID string, task *taskv1.Task, start time.Time) error {
 	task.MaxRetries--
 
@@ -261,7 +264,7 @@ func (c *Consumer) handleFailure(ctx context.Context, taskID string, task *taskv
 		return nil
 	}
 
-	// Retries remain — return error so offset is NOT committed (Kafka redelivers).
+	// Retries remain — stop consumption before a later commit can pass this task.
 	return fmt.Errorf("task %q failed, %d retries remaining", taskID, task.GetMaxRetries())
 }
 

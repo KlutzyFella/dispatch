@@ -56,11 +56,15 @@ type mockSender struct {
 	err       error
 	errOnCall int // 0 = all calls fail; n = only call n fails
 	callCount int
+	onSend    func()
 }
 
 func (m *mockSender) SendUpdate(u *taskv1.ProgressUpdate) (*taskv1.ProgressAck, error) {
 	m.callCount++
 	m.updates = append(m.updates, u)
+	if m.onSend != nil {
+		m.onSend()
+	}
 	if m.err != nil && (m.errOnCall == 0 || m.callCount == m.errOnCall) {
 		return nil, m.err
 	}
@@ -478,5 +482,52 @@ func TestConsumer_Run_FetchError(t *testing.T) {
 
 	if err := c.Run(context.Background()); err == nil {
 		t.Fatal("expected error from fetch failure, got nil")
+	}
+}
+
+func TestConsumer_Run_ProcessErrorStopsBeforeNextFetch(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	commits := 0
+	reader := &mockReader{
+		messages: []kafka.Message{
+			{Key: []byte("failed"), Value: []byte("not-protobuf")},
+			{Key: []byte("healthy"), Value: marshalTask(t, &taskv1.Task{Type: "simulation"})},
+		},
+		onCommit: func() { commits++; cancel() },
+	}
+	c := newTestConsumer(&mockSender{})
+	c.reader = reader
+	if err := c.Run(ctx); err == nil {
+		t.Error("Run must return a processing error instead of advancing to later work")
+	}
+	if reader.idx != 1 || commits != 0 {
+		t.Errorf("fetched %d messages and committed %d; want one fetch and no commits", reader.idx, commits)
+	}
+}
+
+func TestConsumer_Run_CancelledDuringProcessing(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	commits := 0
+	reader := &mockReader{
+		messages: []kafka.Message{{Key: []byte("interrupted"), Value: marshalTask(t, &taskv1.Task{Type: "simulation"})}},
+		onCommit: func() { commits++ },
+	}
+	// Cancel from inside processing, after RUNNING is sent, rather than racing
+	// startup against a short timer that could cancel before the first fetch.
+	sender := &mockSender{onSend: cancel}
+	c := newTestConsumer(sender)
+	c.reader = reader
+	if err := c.Run(ctx); err != nil {
+		t.Errorf("context cancellation should shut down cleanly, got %v", err)
+	}
+	if commits != 0 {
+		t.Errorf("committed interrupted work %d times", commits)
+	}
+	if sender.callCount != 1 || sender.updates[0].GetStatus() != taskv1.TaskStatus_TASK_STATUS_RUNNING {
+		t.Errorf("expected interruption after RUNNING, got updates %v", sender.updates)
 	}
 }

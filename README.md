@@ -44,21 +44,21 @@ Some tasks will fail regardless of how many times they are retried — malformed
 Dispatch implements a **DLQ via a second Kafka topic** (`tasks.dead_letter`). Each task carries a `max_retries` counter. On failure:
 
 1. `max_retries` is decremented and a `TASK_STATUS_FAILED` progress update is sent upstream.
-2. If `max_retries >= 0`, the worker returns an error — the Kafka **offset is not committed**, so the broker redelivers the message on the next poll.
-3. If `max_retries < 0`, all retries are exhausted. The task is published to `tasks.dead_letter` and the offset **is** committed — the task is removed from the active queue permanently and available for inspection or replay.
+2. If `max_retries >= 0`, the worker exits with an error without committing this message. Kafka does not rewind the running reader when a commit is skipped; a new consumer session starts from the group's committed offset.
+3. If `max_retries < 0`, the worker attempts to publish the task to `tasks.dead_letter` and treats the message as handled.
 
-This ensures poison-pill tasks are quarantined without data loss and without blocking healthy work.
+Retry accounting across restarts, replay of held Redis locks, and propagation of DLQ publication failures remain incomplete. The current implementation does not guarantee loss-free quarantine or automatic recovery.
 
 ### Offset Management as a Reliability Guarantee
 
-The consumer's commit strategy is the linchpin of the retry mechanism. Offsets are committed **only after a message is fully and successfully handled** — either completed, or dead-lettered. If processing fails and retries remain, the consumer deliberately skips the commit:
+Kafka consumer groups track one committed offset per partition. Committing a later message also acknowledges earlier messages in that partition. When `processMessage` returns an error, the consumer stops instead of fetching later work:
 
 ```go
-// Do not commit: the message will be redelivered.
-continue
+return fmt.Errorf("processing message from %s[%d] at offset %d: %w",
+    msg.Topic, msg.Partition, msg.Offset, err)
 ```
 
-This is intentional. It means the system's retry behavior is enforced at the transport layer (Kafka), not in application memory. Worker crashes, OOM kills, and ungraceful shutdowns are handled for free — the message simply reappears on the next poll.
+The worker closes its reader and exits nonzero on that error. This prevents a later commit from passing the failed message. Real-Kafka integration tests verify the committed offset and that a new reader in the same group can fetch the unresolved message. Cancellation shuts down without committing interrupted work.
 
 ---
 
