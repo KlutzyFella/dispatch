@@ -39,7 +39,8 @@ func NewKafkaProducer(brokerAddr, topic string, logger *slog.Logger) *KafkaProdu
 	w := &kafka.Writer{
 		Addr:                   kafka.TCP(brokerAddr),
 		Topic:                  topic,
-		Balancer:               &kafka.Hash{}, // route by key hash for partition consistency
+		Balancer:               &kafka.Hash{},    // route by key hash for partition consistency
+		RequiredAcks:           kafka.RequireAll, // surface broker rejections before accepting work
 		AllowAutoTopicCreation: true,
 	}
 	return &KafkaProducer{writer: w, logger: logger}

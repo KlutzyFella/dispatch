@@ -224,3 +224,20 @@ make lint           # go vet
 make docker-build   # Build both Docker images
 make clean          # Remove generated artifacts and binaries
 ```
+
+## Tests
+
+Start Kafka and Redis, verify that both answer protocol requests, then include
+the real-Kafka regression tests with the `integration` build tag:
+
+```bash
+docker compose up -d kafka redis
+docker compose exec -T redis redis-cli ping
+docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+GOTOOLCHAIN=go1.23.0 go test -tags=integration -count=1 -race ./...
+```
+
+Kafka tests use `localhost:9092` by default, accept `KAFKA_BROKER` as an override,
+and fail when the broker is unavailable. They create uniquely named topics and
+delete those topics at cleanup. Redis tests currently require `localhost:6379`
+and skip when Redis is absent. The commands above provide both services.
