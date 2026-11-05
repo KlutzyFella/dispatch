@@ -241,6 +241,24 @@ func TestProcessMessage_ReporterFailsOnRunning(t *testing.T) {
 	}
 }
 
+func TestProcessMessage_ReporterFailsOnFailed(t *testing.T) {
+	t.Parallel()
+	reportErr := errors.New("FAILED progress stream broken")
+	sender := &mockSender{err: reportErr, errOnCall: 2}
+	dlq := &mockDLQPublisher{}
+	c := newTestConsumer(sender)
+	c.dlqPublisher = dlq
+	executions := 0
+	c.failureDecider = func() bool { executions++; return true }
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := c.processMessage(ctx, []byte("failed-report"), marshalTask(t, &taskv1.Task{Type: "simulation", MaxRetries: 1}))
+	count := c.attempts.(*mockAttemptStore).counts["failed-report"]
+	if !errors.Is(err, reportErr) || executions != 1 || count != 1 || len(dlq.published) != 0 {
+		t.Fatalf("reporting error was swallowed or consumed retries: error=%v executions=%d attempts=%d DLQ=%v", err, executions, count, dlq.published)
+	}
+}
+
 // ── processMessage: failure / DLQ ─────────────────────────────────────────────
 
 func TestProcessMessage_RetriesBeforeAdvancing(t *testing.T) {

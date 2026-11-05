@@ -54,6 +54,8 @@ return fmt.Errorf("processing message from %s[%d] at offset %d: %w",
 
 The worker closes its reader and exits nonzero on that error. This prevents a later commit from passing the failed message. Real-Kafka integration tests verify the committed offset and that a new reader in the same group can fetch the unresolved message. Cancellation shuts down without committing interrupted work.
 
+Progress-stream transport errors on RUNNING, FAILED, or COMPLETED stop consumption rather than spend more retries. Negative `recorded=false` acknowledgments are still logged without stopping execution; that handling remains an open issue.
+
 ---
 
 ## Tech Stack

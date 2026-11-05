@@ -217,8 +217,7 @@ func (c *Consumer) processAttempt(ctx context.Context, taskID string) (bool, err
 		decider = func() bool { return false }
 	}
 	if decider() {
-		c.handleFailure(ctx, taskID, start)
-		return true, nil
+		return true, c.handleFailure(ctx, taskID, start)
 	}
 
 	// Report COMPLETED.
@@ -251,7 +250,7 @@ func (c *Consumer) processAttempt(ctx context.Context, taskID string) (bool, err
 
 // handleFailure records a simulated failed attempt without mutating the task's
 // configured retry budget or acknowledging its Kafka message.
-func (c *Consumer) handleFailure(ctx context.Context, taskID string, start time.Time) {
+func (c *Consumer) handleFailure(ctx context.Context, taskID string, start time.Time) error {
 	metrics.TasksFailedTotal.Inc()
 	metrics.TaskExecutionDuration.Observe(time.Since(start).Seconds())
 
@@ -267,11 +266,9 @@ func (c *Consumer) handleFailure(ctx context.Context, taskID string, start time.
 		Status:   taskv1.TaskStatus_TASK_STATUS_FAILED,
 		Progress: 0,
 	}); err != nil {
-		c.logger.Error("failed to send FAILED update",
-			slog.String("task_id", taskID),
-			slog.String("error", err.Error()),
-		)
+		return fmt.Errorf("sending FAILED update for task %q: %w", taskID, err)
 	}
+	return nil
 }
 
 func (c *Consumer) publishDeadLetter(ctx context.Context, taskID string, task *taskv1.Task) error {
