@@ -23,6 +23,10 @@ Dispatch separates concerns across two independent binaries:
 
 Tasks travel through the Kafka topic `tasks.pending`. Both services use Redis task records; workers report progress over the gRPC stream and reserve execution attempts in Redis.
 
+Both services honor `KAFKA_TOPIC` for the pending-work topic; its default is
+`tasks.pending`. Set the same value on dispatch and worker. The DLQ remains
+`tasks.dead_letter`.
+
 ### Delivery and Replay
 
 Kafka consumer groups resume from committed offsets. The worker stops on processing errors so a later commit cannot pass unresolved work. A new consumer session can fetch that work again.

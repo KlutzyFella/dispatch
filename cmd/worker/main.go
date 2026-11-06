@@ -27,6 +27,7 @@ const (
 	defaultMetricsPort  = "9091"
 
 	envKafkaBroker  = "KAFKA_BROKER"
+	envKafkaTopic   = "KAFKA_TOPIC"
 	envKafkaGroupID = "KAFKA_GROUP_ID"
 	envGRPCAddr     = "GRPC_SERVER_ADDR"
 	envRedisAddr    = "REDIS_ADDR"
@@ -45,6 +46,7 @@ func main() {
 // run wires up the worker and returns on SIGINT/SIGTERM or a service error.
 func run(logger *slog.Logger) error {
 	kafkaBroker := envOrDefault(envKafkaBroker, defaultKafkaBroker)
+	kafkaTopic := envOrDefault(envKafkaTopic, defaultKafkaTopic)
 	groupID := envOrDefault(envKafkaGroupID, defaultKafkaGroupID)
 	grpcAddr := envOrDefault(envGRPCAddr, defaultGRPCAddr)
 	redisAddr := envOrDefault(envRedisAddr, defaultRedisAddr)
@@ -54,6 +56,7 @@ func run(logger *slog.Logger) error {
 	logger.Info("starting worker",
 		slog.String("worker_id", workerID),
 		slog.String("kafka_broker", kafkaBroker),
+		slog.String("kafka_topic", kafkaTopic),
 		slog.String("group_id", groupID),
 		slog.String("grpc_addr", grpcAddr),
 		slog.String("redis_addr", redisAddr),
@@ -101,7 +104,7 @@ func run(logger *slog.Logger) error {
 
 	// ── Kafka consumer ─────────────────────────────────────────────────────────
 	consumer := worker.NewConsumer(
-		kafkaBroker, defaultKafkaTopic, groupID, workerID,
+		kafkaBroker, kafkaTopic, groupID, workerID,
 		reporter, attemptStore, dlqProducer,
 		logger,
 	)
