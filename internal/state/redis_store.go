@@ -11,6 +11,14 @@ import (
 
 const taskKeyPrefix = "task:"
 
+var updateProgress = redis.NewScript(`
+if redis.call('EXISTS', KEYS[1]) == 0 then
+    return 0
+end
+redis.call('HSET', KEYS[1], 'status', ARGV[1], 'progress', ARGV[2], 'updated_at', ARGV[3])
+return 1
+`)
+
 // RedisTaskStore implements TaskStore using Redis hashes for task records.
 type RedisTaskStore struct {
 	client *redis.Client
@@ -55,25 +63,17 @@ func (s *RedisTaskStore) GetTask(ctx context.Context, taskID string) (TaskRecord
 }
 
 // UpdateProgress updates the status, progress, and updated_at fields of an
-// existing task. Returns ErrTaskNotFound if the task hash does not exist.
+// existing task atomically. Returns ErrTaskNotFound if the task hash does not
+// exist, without recreating a task deleted concurrently.
 func (s *RedisTaskStore) UpdateProgress(ctx context.Context, taskID string, status, progress int32) error {
 	key := taskKeyPrefix + taskID
 
-	exists, err := s.client.Exists(ctx, key).Result()
+	updated, err := updateProgress.Run(ctx, s.client, []string{key}, status, progress, time.Now().UnixNano()).Int64()
 	if err != nil {
-		return fmt.Errorf("checking task %q existence: %w", taskID, err)
-	}
-	if exists == 0 {
-		return ErrTaskNotFound
-	}
-
-	fields := map[string]any{
-		"status":     status,
-		"progress":   progress,
-		"updated_at": time.Now().UnixNano(),
-	}
-	if err := s.client.HSet(ctx, key, fields).Err(); err != nil {
 		return fmt.Errorf("updating progress for task %q: %w", taskID, err)
+	}
+	if updated == 0 {
+		return ErrTaskNotFound
 	}
 	return nil
 }
