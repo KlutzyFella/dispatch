@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
@@ -34,6 +35,7 @@ const (
 	redisAddrEnvVar    = "REDIS_ADDR"
 	metricsPortEnvVar  = "METRICS_PORT"
 	serviceName        = "dispatch.v1.DispatchService"
+	grpcShutdownGrace  = 5 * time.Second
 )
 
 func main() {
@@ -124,7 +126,19 @@ func run(logger *slog.Logger, port string) error {
 		return err
 	case <-ctx.Done():
 		logger.Info("shutdown signal received — draining connections")
-		grpcSrv.GracefulStop()
+		drained := make(chan struct{})
+		go func() {
+			grpcSrv.GracefulStop()
+			close(drained)
+		}()
+		timer := time.NewTimer(grpcShutdownGrace)
+		defer timer.Stop()
+		select {
+		case <-drained:
+		case <-timer.C:
+			logger.Warn("forcing gRPC shutdown", slog.Duration("grace_period", grpcShutdownGrace))
+			grpcSrv.Stop()
+		}
 		return nil
 	}
 }

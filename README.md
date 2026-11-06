@@ -132,6 +132,15 @@ Expected response:
 
 To verify idempotency, supply the same `idempotency_key` in a second call — the server returns the original `task_id` without re-enqueuing.
 
+### Shutdown
+
+On SIGINT or SIGTERM, dispatch gives existing gRPC calls five seconds to drain.
+It then logs `forcing gRPC shutdown` and closes remaining connections, including
+workers' open progress streams. Closed streams drain without waiting for the
+deadline. The integration regression executes the actual `main` in a compiled
+subprocess, checks both paths, and verifies that its gRPC and metrics ports are
+released. This deadline bounds gRPC draining, not every dependency's cleanup.
+
 ---
 
 ## Observability
