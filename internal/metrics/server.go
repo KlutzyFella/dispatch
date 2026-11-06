@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
@@ -12,10 +13,13 @@ import (
 
 // StartServer starts an HTTP server that exposes the default Prometheus
 // registry at /metrics on the given addr (e.g. ":9090").
-// It shuts down gracefully when ctx is cancelled.
-// Errors from ListenAndServe (other than http.ErrServerClosed) are returned
-// via the errCh channel that callers can ignore.
-func StartServer(ctx context.Context, addr string, logger *slog.Logger) {
+// Binding is synchronous: startup errors are returned before any goroutine is
+// started. Later serving errors are logged. Cancellation shuts down the server.
+func StartServer(ctx context.Context, addr string, logger *slog.Logger) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listening for metrics on %s: %w", addr, err)
+	}
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 
@@ -25,8 +29,7 @@ func StartServer(ctx context.Context, addr string, logger *slog.Logger) {
 	}
 
 	go func() {
-		logger.Info("metrics HTTP server listening", slog.String("addr", addr))
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
 			logger.Error("metrics server error", slog.String("error", err.Error()))
 		}
 	}()
@@ -41,5 +44,6 @@ func StartServer(ctx context.Context, addr string, logger *slog.Logger) {
 		logger.Info("metrics HTTP server stopped", slog.String("addr", addr))
 	}()
 
-	logger.Info("metrics server started", slog.String("addr", fmt.Sprintf("http://localhost%s/metrics", addr)))
+	logger.Info("metrics HTTP server listening", slog.String("addr", listener.Addr().String()))
+	return nil
 }

@@ -42,7 +42,7 @@ func main() {
 	}
 }
 
-// run wires up and starts the worker, blocking until SIGINT/SIGTERM.
+// run wires up the worker and returns on SIGINT/SIGTERM or a service error.
 func run(logger *slog.Logger) error {
 	kafkaBroker := envOrDefault(envKafkaBroker, defaultKafkaBroker)
 	groupID := envOrDefault(envKafkaGroupID, defaultKafkaGroupID)
@@ -95,7 +95,9 @@ func run(logger *slog.Logger) error {
 
 	// ── Metrics HTTP server ────────────────────────────────────────────────────
 	metricsPort := envOrDefault(envMetricsPort, defaultMetricsPort)
-	metrics.StartServer(ctx, ":"+metricsPort, logger)
+	if err := metrics.StartServer(ctx, ":"+metricsPort, logger); err != nil {
+		return fmt.Errorf("starting metrics server: %w", err)
+	}
 
 	// ── Kafka consumer ─────────────────────────────────────────────────────────
 	consumer := worker.NewConsumer(

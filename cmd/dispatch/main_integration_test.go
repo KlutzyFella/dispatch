@@ -7,6 +7,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -103,4 +105,44 @@ func TestDispatch_ShutdownWithProgressStream(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDispatch_FailsWhenMetricsPortOccupied(t *testing.T) {
+	if testutil.MainProcessChild() {
+		main()
+		return
+	}
+	redis := testutil.RedisClient(t)
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	metricsPort := strconv.Itoa(occupied.Addr().(*net.TCPAddr).Port)
+	port := testutil.UnusedTCPPort(t)
+	process := testutil.StartMainProcess(t, map[string]string{
+		"PORT": port, "METRICS_PORT": metricsPort,
+		"REDIS_ADDR": redis.Options().Addr, "KAFKA_BROKER": "127.0.0.1:1",
+	})
+	exitErr, exited := process.Wait(3 * time.Second)
+	if !exited {
+		t.Error("dispatch kept running after its metrics listener failed to bind")
+		if err := process.Signal(syscall.SIGTERM); err != nil {
+			t.Fatal(err)
+		}
+		exitErr, exited = process.Wait(8 * time.Second)
+	}
+	var exit *exec.ExitError
+	if !exited || !errors.As(exitErr, &exit) || exit.ExitCode() != 1 {
+		t.Errorf("startup failure must exit 1, got exited=%v error=%v", exited, exitErr)
+	}
+	logs := process.Logs(t)
+	if !strings.Contains(logs, "starting metrics server") || !strings.Contains(logs, metricsPort) {
+		t.Errorf("startup error did not identify metrics and its occupied port:\n%s", logs)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:"+port)
+	if err != nil {
+		t.Fatalf("failed startup left gRPC port %s occupied: %v", port, err)
+	}
+	listener.Close()
 }

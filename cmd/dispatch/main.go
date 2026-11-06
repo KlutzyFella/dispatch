@@ -52,7 +52,7 @@ func main() {
 	}
 }
 
-// run wires up and starts the gRPC server, blocking until SIGINT/SIGTERM.
+// run wires up the gRPC server and returns on SIGINT/SIGTERM or a service error.
 func run(logger *slog.Logger, port string) error {
 	kafkaBroker := envOrDefault(kafkaBrokerEnvVar, defaultKafkaBroker)
 	kafkaTopic := envOrDefault(kafkaTopicEnvVar, defaultKafkaTopic)
@@ -91,7 +91,9 @@ func run(logger *slog.Logger, port string) error {
 
 	// ── Metrics HTTP server ────────────────────────────────────────────────────
 	metricsPort := envOrDefault(metricsPortEnvVar, defaultMetricsPort)
-	metrics.StartServer(ctx, ":"+metricsPort, logger)
+	if err := metrics.StartServer(ctx, ":"+metricsPort, logger); err != nil {
+		return fmt.Errorf("starting metrics server: %w", err)
+	}
 
 	// ── gRPC server ────────────────────────────────────────────────────────────
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))

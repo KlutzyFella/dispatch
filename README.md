@@ -156,6 +156,12 @@ Both services expose a `/metrics` endpoint scraped by Prometheus every 15 second
 | `tasks_failed_total` | Counter | Failed simulated execution attempts |
 | `task_execution_duration_seconds` | Histogram | Per-attempt simulated execution duration; excludes queue wait |
 
+Both services require their metrics listener to bind during startup. An invalid
+or occupied metrics address exits with status 1 and identifies the address in
+the error; choose an unused `METRICS_PORT` or stop the process holding that port.
+Errors after the metrics HTTP server has started are currently logged rather
+than propagated to the main service.
+
 ### Grafana
 
 Navigate to `http://localhost:3000` (credentials: `admin` / `admin`).
