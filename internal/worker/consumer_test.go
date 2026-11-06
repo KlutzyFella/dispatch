@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,6 +55,7 @@ func (m *mockReader) Close() error { return m.closeErr }
 type mockSender struct {
 	updates   []*taskv1.ProgressUpdate
 	ack       *taskv1.ProgressAck
+	ackOnCall int // 0 = use ack for every call; n = only call n uses ack
 	err       error
 	errOnCall int // 0 = all calls fail; n = only call n fails
 	callCount int
@@ -69,7 +71,7 @@ func (m *mockSender) SendUpdate(u *taskv1.ProgressUpdate) (*taskv1.ProgressAck, 
 	if m.err != nil && (m.errOnCall == 0 || m.callCount == m.errOnCall) {
 		return nil, m.err
 	}
-	if m.ack != nil {
+	if m.ack != nil && (m.ackOnCall == 0 || m.callCount == m.ackOnCall) {
 		return m.ack, nil
 	}
 	return &taskv1.ProgressAck{Recorded: true}, nil
@@ -524,5 +526,55 @@ func TestConsumer_Run_CancelledDuringProcessing(t *testing.T) {
 	}
 	if sender.callCount != 1 || sender.updates[0].GetStatus() != taskv1.TaskStatus_TASK_STATUS_RUNNING {
 		t.Errorf("expected interruption after RUNNING, got updates %v", sender.updates)
+	}
+}
+
+func TestConsumer_Run_StopsOnRejectedProgress(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     taskv1.TaskStatus
+		rejectCall int
+		failTask   bool
+		exhausted  bool
+		executions int
+	}{
+		{name: "running", status: taskv1.TaskStatus_TASK_STATUS_RUNNING, rejectCall: 1},
+		{name: "completed", status: taskv1.TaskStatus_TASK_STATUS_COMPLETED, rejectCall: 2, executions: 1},
+		{name: "failed", status: taskv1.TaskStatus_TASK_STATUS_FAILED, rejectCall: 2, failTask: true, executions: 1},
+		{name: "exhausted_replay", status: taskv1.TaskStatus_TASK_STATUS_FAILED, rejectCall: 1, exhausted: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			id := "rejected-" + tc.name
+			task := &taskv1.Task{Type: "simulation", MaxRetries: 1}
+			attempts := &mockAttemptStore{counts: make(map[string]int64)}
+			if tc.exhausted {
+				task.MaxRetries = 0
+				attempts.counts[id] = 1
+			}
+			sender := &mockSender{ack: &taskv1.ProgressAck{Recorded: false}, ackOnCall: tc.rejectCall}
+			dlq := &mockDLQPublisher{}
+			c := newTestConsumer(sender)
+			c.attempts, c.dlqPublisher = attempts, dlq
+			executions, commits := 0, 0
+			c.failureDecider = func() bool { executions++; return tc.failTask }
+			c.reader = &mockReader{
+				messages: []kafka.Message{{Key: []byte(id), Value: marshalTask(t, task)}},
+				onCommit: func() { commits++; cancel() },
+			}
+			err := c.Run(ctx)
+			if err == nil || !strings.Contains(err.Error(), tc.status.String()) || !strings.Contains(err.Error(), "not recorded") {
+				t.Errorf("rejected %s must stop consumption with its cause, got %v", tc.status, err)
+			}
+			if commits != 0 || len(dlq.published) != 0 || executions != tc.executions || attempts.counts[id] != 1 {
+				t.Errorf("rejected progress advanced work: commits=%d DLQ=%v executions=%d attempts=%d", commits, dlq.published, executions, attempts.counts[id])
+			}
+			if sender.callCount != tc.rejectCall {
+				t.Errorf("continued after rejected update: calls=%d, want %d", sender.callCount, tc.rejectCall)
+			}
+		})
 	}
 }

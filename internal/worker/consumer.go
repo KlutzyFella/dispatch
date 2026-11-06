@@ -161,11 +161,8 @@ func (c *Consumer) processMessage(ctx context.Context, key, value []byte) error 
 				return nil
 			}
 			if record.Status != int32(taskv1.TaskStatus_TASK_STATUS_FAILED) {
-				if _, err := c.reporter.SendUpdate(&taskv1.ProgressUpdate{
-					TaskId: taskID, WorkerId: c.workerID,
-					Status: taskv1.TaskStatus_TASK_STATUS_FAILED,
-				}); err != nil {
-					return fmt.Errorf("reporting exhausted task %q: %w", taskID, err)
+				if err := c.reportProgress(taskID, taskv1.TaskStatus_TASK_STATUS_FAILED, 0); err != nil {
+					return err
 				}
 			}
 			return c.publishDeadLetter(ctx, taskID, &task)
@@ -188,20 +185,8 @@ func (c *Consumer) processAttempt(ctx context.Context, taskID string) (bool, err
 	start := time.Now()
 
 	// Report RUNNING.
-	ack, err := c.reporter.SendUpdate(&taskv1.ProgressUpdate{
-		TaskId:   taskID,
-		WorkerId: c.workerID,
-		Status:   taskv1.TaskStatus_TASK_STATUS_RUNNING,
-		Progress: 0,
-	})
-	if err != nil {
-		return false, fmt.Errorf("sending RUNNING update for task %q: %w", taskID, err)
-	}
-	if !ack.GetRecorded() {
-		c.logger.Warn("RUNNING update not recorded by server",
-			slog.String("task_id", taskID),
-			slog.String("worker_id", c.workerID),
-		)
+	if err := c.reportProgress(taskID, taskv1.TaskStatus_TASK_STATUS_RUNNING, 0); err != nil {
+		return false, err
 	}
 
 	// Simulate work — interruptible by context cancellation.
@@ -221,20 +206,8 @@ func (c *Consumer) processAttempt(ctx context.Context, taskID string) (bool, err
 	}
 
 	// Report COMPLETED.
-	ack, err = c.reporter.SendUpdate(&taskv1.ProgressUpdate{
-		TaskId:   taskID,
-		WorkerId: c.workerID,
-		Status:   taskv1.TaskStatus_TASK_STATUS_COMPLETED,
-		Progress: 100,
-	})
-	if err != nil {
-		return false, fmt.Errorf("sending COMPLETED update for task %q: %w", taskID, err)
-	}
-	if !ack.GetRecorded() {
-		c.logger.Warn("COMPLETED update not recorded by server",
-			slog.String("task_id", taskID),
-			slog.String("worker_id", c.workerID),
-		)
+	if err := c.reportProgress(taskID, taskv1.TaskStatus_TASK_STATUS_COMPLETED, 100); err != nil {
+		return false, err
 	}
 
 	metrics.TasksCompletedTotal.Inc()
@@ -259,14 +232,23 @@ func (c *Consumer) handleFailure(ctx context.Context, taskID string, start time.
 		slog.String("worker_id", c.workerID),
 	)
 
-	// Always report FAILED status.
-	if _, err := c.reporter.SendUpdate(&taskv1.ProgressUpdate{
+	return c.reportProgress(taskID, taskv1.TaskStatus_TASK_STATUS_FAILED, 0)
+}
+
+// reportProgress requires an explicit recording acknowledgment before processing
+// can advance. A transport success alone does not mean the state was persisted.
+func (c *Consumer) reportProgress(taskID string, status taskv1.TaskStatus, progress int32) error {
+	ack, err := c.reporter.SendUpdate(&taskv1.ProgressUpdate{
 		TaskId:   taskID,
 		WorkerId: c.workerID,
-		Status:   taskv1.TaskStatus_TASK_STATUS_FAILED,
-		Progress: 0,
-	}); err != nil {
-		return fmt.Errorf("sending FAILED update for task %q: %w", taskID, err)
+		Status:   status,
+		Progress: progress,
+	})
+	if err != nil {
+		return fmt.Errorf("reporting %s for task %q: %w", status, taskID, err)
+	}
+	if !ack.GetRecorded() {
+		return fmt.Errorf("%s update for task %q was not recorded", status, taskID)
 	}
 	return nil
 }
