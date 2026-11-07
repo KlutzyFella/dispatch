@@ -12,6 +12,9 @@ import (
 // ErrTaskNotFound is returned by GetTask when the requested task does not exist.
 var ErrTaskNotFound = errors.New("task not found")
 
+// ErrTaskCompleted rejects progress changes to an already completed task.
+var ErrTaskCompleted = errors.New("task already completed")
+
 // TaskRecord is the canonical storage model for a task.
 // It uses primitive types so the state package has no dependency on proto-generated code.
 type TaskRecord struct {

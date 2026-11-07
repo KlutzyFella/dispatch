@@ -72,7 +72,7 @@ in 0–100; COMPLETED requires exactly 100. PENDING is assigned by submission,
 and cancellation is not implemented. Unsupported statuses are rejected without
 changing the task record.
 
-Redis checks task existence and writes progress atomically. If deletion wins before the update, the update is rejected without recreating a partial task record. This does not enforce lifecycle transition ordering.
+Redis checks task existence and writes progress atomically. If deletion wins before the update, the update is rejected without recreating a partial task record. Progress updates cannot reverse COMPLETED; repeating COMPLETED/100 leaves the record and completion time unchanged. FAILED may return to RUNNING for a retry. Intermediate updates are not attempt-fenced, and submission/publication races remain open.
 
 ---
 

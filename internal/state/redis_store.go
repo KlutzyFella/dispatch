@@ -11,9 +11,19 @@ import (
 
 const taskKeyPrefix = "task:"
 
+// The persisted dispatch.v1.TaskStatus wire value. Integration tests seed the
+// generated COMPLETED enum to keep this primitive storage contract aligned.
+const completedTaskStatus int32 = 3
+
 var updateProgress = redis.NewScript(`
 if redis.call('EXISTS', KEYS[1]) == 0 then
     return 0
+end
+if tonumber(redis.call('HGET', KEYS[1], 'status')) == tonumber(ARGV[4]) then
+    if ARGV[1] == ARGV[4] and ARGV[2] == '100' then
+        return 1
+    end
+    return -1
 end
 redis.call('HSET', KEYS[1], 'status', ARGV[1], 'progress', ARGV[2], 'updated_at', ARGV[3])
 return 1
@@ -65,15 +75,20 @@ func (s *RedisTaskStore) GetTask(ctx context.Context, taskID string) (TaskRecord
 // UpdateProgress updates the status, progress, and updated_at fields of an
 // existing task atomically. Returns ErrTaskNotFound if the task hash does not
 // exist, without recreating a task deleted concurrently.
+// Completed tasks accept only an unchanged completion acknowledgment; other
+// updates return ErrTaskCompleted and leave all fields untouched.
 func (s *RedisTaskStore) UpdateProgress(ctx context.Context, taskID string, status, progress int32) error {
 	key := taskKeyPrefix + taskID
 
-	updated, err := updateProgress.Run(ctx, s.client, []string{key}, status, progress, time.Now().UnixNano()).Int64()
+	updated, err := updateProgress.Run(ctx, s.client, []string{key}, status, progress, time.Now().UnixNano(), completedTaskStatus).Int64()
 	if err != nil {
 		return fmt.Errorf("updating progress for task %q: %w", taskID, err)
 	}
 	if updated == 0 {
 		return ErrTaskNotFound
+	}
+	if updated == -1 {
+		return ErrTaskCompleted
 	}
 	return nil
 }
