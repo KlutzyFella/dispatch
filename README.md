@@ -40,7 +40,10 @@ Kafka consumer groups resume from committed offsets. The worker stops on process
 
 Execution can repeat if a worker exits after doing work but before recording completion. Replayed tasks already recorded COMPLETED are acknowledged without another execution. There is no exactly-once execution guarantee. Old Redis lock keys do not suppress replay or acknowledge unfinished work.
 
-Sequential submissions sharing an `idempotency_key` return the original `task_id`. Concurrent admission and publication failure recovery remain open issues.
+Task creation is atomic, so competing first submissions cannot overwrite each
+other's record. Sequential submissions sharing an `idempotency_key` return the
+original `task_id`; in-flight duplicate acceptance and publication recovery
+remain open issues.
 
 ### Dead-Letter Queue (DLQ) for Poison-Pill Tasks
 

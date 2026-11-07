@@ -15,6 +15,16 @@ const taskKeyPrefix = "task:"
 // generated COMPLETED enum to keep this primitive storage contract aligned.
 const completedTaskStatus int32 = 3
 
+var createTask = redis.NewScript(`
+if redis.call('EXISTS', KEYS[1]) ~= 0 then
+    return 0
+end
+redis.call('HSET', KEYS[1], 'id', ARGV[1], 'task_type', ARGV[2],
+    'priority', ARGV[3], 'max_retries', ARGV[4], 'status', ARGV[5],
+    'progress', ARGV[6], 'created_at', ARGV[7], 'updated_at', ARGV[8])
+return 1
+`)
+
 var updateProgress = redis.NewScript(`
 if redis.call('EXISTS', KEYS[1]) == 0 then
     return 0
@@ -39,21 +49,17 @@ func NewRedisTaskStore(client *redis.Client) *RedisTaskStore {
 	return &RedisTaskStore{client: client}
 }
 
-// SaveTask serialises a TaskRecord into a Redis hash at key "task:{id}".
+// SaveTask atomically creates the hash at "task:{id}" without replacing it.
 func (s *RedisTaskStore) SaveTask(ctx context.Context, record TaskRecord) error {
 	key := taskKeyPrefix + record.ID
-	fields := map[string]any{
-		"id":          record.ID,
-		"task_type":   record.TaskType,
-		"priority":    record.Priority,
-		"max_retries": record.MaxRetries,
-		"status":      record.Status,
-		"progress":    record.Progress,
-		"created_at":  record.CreatedAt.UnixNano(),
-		"updated_at":  record.UpdatedAt.UnixNano(),
-	}
-	if err := s.client.HSet(ctx, key, fields).Err(); err != nil {
+	created, err := createTask.Run(ctx, s.client, []string{key}, record.ID, record.TaskType,
+		record.Priority, record.MaxRetries, record.Status, record.Progress,
+		record.CreatedAt.UnixNano(), record.UpdatedAt.UnixNano()).Int64()
+	if err != nil {
 		return fmt.Errorf("saving task %q: %w", record.ID, err)
+	}
+	if created == 0 {
+		return ErrTaskExists
 	}
 	return nil
 }

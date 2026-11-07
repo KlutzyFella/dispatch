@@ -12,6 +12,8 @@ import (
 // ErrTaskNotFound is returned by GetTask when the requested task does not exist.
 var ErrTaskNotFound = errors.New("task not found")
 
+var ErrTaskExists = errors.New("task already exists")
+
 // ErrTaskCompleted rejects progress changes to an already completed task.
 var ErrTaskCompleted = errors.New("task already completed")
 
@@ -31,8 +33,8 @@ type TaskRecord struct {
 // TaskStore defines the persistence operations required by the dispatch server.
 // All implementations must be safe for concurrent use.
 type TaskStore interface {
-	// SaveTask persists a new task record. It must be idempotent — calling
-	// SaveTask twice with the same ID overwrites the previous record.
+	// SaveTask atomically creates a task. Existing records return ErrTaskExists
+	// without overwriting progress, retry accounting, or admission state.
 	SaveTask(ctx context.Context, record TaskRecord) error
 
 	// GetTask returns the task with the given ID, or ErrTaskNotFound if absent.

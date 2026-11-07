@@ -25,6 +25,9 @@ func newMemoryStore() *memoryStore {
 func (m *memoryStore) SaveTask(_ context.Context, record state.TaskRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if _, exists := m.tasks[record.ID]; exists {
+		return state.ErrTaskExists
+	}
 	m.tasks[record.ID] = record
 	return nil
 }

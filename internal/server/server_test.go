@@ -60,6 +60,9 @@ func (m *mockTaskStore) SaveTask(_ context.Context, record state.TaskRecord) err
 	if m.saveErr != nil {
 		return m.saveErr
 	}
+	if _, exists := m.tasks[record.ID]; exists {
+		return state.ErrTaskExists
+	}
 	m.tasks[record.ID] = record
 	return nil
 }

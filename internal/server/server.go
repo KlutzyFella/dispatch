@@ -96,6 +96,9 @@ func (s *DispatchServer) SubmitTask(ctx context.Context, req *taskv1.SubmitTaskR
 	}
 
 	if err := s.store.SaveTask(ctx, record); err != nil {
+		if errors.Is(err, state.ErrTaskExists) {
+			return nil, status.Errorf(codes.Unavailable, "task %q admission is in progress; retry with the same idempotency key", taskID)
+		}
 		s.logger.ErrorContext(ctx, "failed to save task to store",
 			slog.String("task_id", taskID),
 			slog.String("error", err.Error()),
