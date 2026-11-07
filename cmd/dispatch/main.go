@@ -106,7 +106,7 @@ func run(logger *slog.Logger, port string) error {
 
 	grpcSrv := grpc.NewServer()
 
-	dispatchSrv := server.New(logger, producer, taskStore)
+	dispatchSrv := server.New(logger, producer, taskStore, kafkaTopic)
 	taskv1.RegisterDispatchServiceServer(grpcSrv, dispatchSrv)
 
 	healthSrv := health.NewServer()

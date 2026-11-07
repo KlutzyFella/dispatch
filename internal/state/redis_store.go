@@ -152,13 +152,15 @@ func parseRecord(taskID string, vals map[string]string) (TaskRecord, error) {
 	}
 
 	return TaskRecord{
-		ID:         taskID,
-		TaskType:   vals["task_type"],
-		Priority:   priority,
-		MaxRetries: maxRetries,
-		Status:     statusVal,
-		Progress:   progress,
-		CreatedAt:  time.Unix(0, createdNano),
-		UpdatedAt:  time.Unix(0, updatedNano),
+		ID:               taskID,
+		TaskType:         vals["task_type"],
+		Priority:         priority,
+		MaxRetries:       maxRetries,
+		Status:           statusVal,
+		Progress:         progress,
+		CreatedAt:        time.Unix(0, createdNano),
+		UpdatedAt:        time.Unix(0, updatedNano),
+		PublicationState: vals["publication_state"],
+		PublicationTopic: vals["publication_topic"],
 	}, nil
 }

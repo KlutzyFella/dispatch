@@ -45,15 +45,15 @@ var _ broker.Producer = (*mockProducer)(nil)
 // ── Mock TaskStore ─────────────────────────────────────────────────────────────
 
 type mockTaskStore struct {
-	tasks     map[string]state.TaskRecord
-	saveErr   error
-	getErr    error
-	updateErr error
-	deleteErr error
+	tasks        map[string]state.TaskRecord
+	saveErr      error
+	getErr       error
+	updateErr    error
+	publications map[string]state.Publication
 }
 
 func newMockStore() *mockTaskStore {
-	return &mockTaskStore{tasks: make(map[string]state.TaskRecord)}
+	return &mockTaskStore{tasks: make(map[string]state.TaskRecord), publications: make(map[string]state.Publication)}
 }
 
 func (m *mockTaskStore) SaveTask(_ context.Context, record state.TaskRecord) error {
@@ -94,20 +94,56 @@ func (m *mockTaskStore) UpdateProgress(_ context.Context, taskID string, s, p in
 }
 
 func (m *mockTaskStore) DeleteTask(_ context.Context, taskID string) error {
-	if m.deleteErr != nil {
-		return m.deleteErr
-	}
 	delete(m.tasks, taskID)
+	delete(m.publications, taskID)
 	return nil
 }
 
-var _ state.TaskStore = (*mockTaskStore)(nil)
+func (m *mockTaskStore) AdmitTask(ctx context.Context, record state.TaskRecord, p state.Publication, _ time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	record.PublicationState, record.PublicationTopic = "pending", p.Topic
+	if err := m.SaveTask(ctx, record); err != nil {
+		return err
+	}
+	m.publications[record.ID] = p
+	return nil
+}
+
+func (m *mockTaskStore) ConfirmPublication(ctx context.Context, p state.Publication) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if m.publications[p.ID].Owner != p.Owner {
+		return state.ErrPublicationLeaseLost
+	}
+	record := m.tasks[p.ID]
+	record.PublicationState = "published"
+	m.tasks[p.ID] = record
+	delete(m.publications, p.ID)
+	return nil
+}
+
+func (m *mockTaskStore) ReleasePublication(ctx context.Context, p state.Publication, _ time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if m.publications[p.ID].Owner != p.Owner {
+		return state.ErrPublicationLeaseLost
+	}
+	p.Owner = ""
+	m.publications[p.ID] = p
+	return nil
+}
+
+var _ state.PublicationStore = (*mockTaskStore)(nil)
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
-func newTestServer(t *testing.T, p broker.Producer, s state.TaskStore) *server.DispatchServer {
+func newTestServer(t *testing.T, p broker.Producer, s state.PublicationStore) *server.DispatchServer {
 	t.Helper()
-	return server.New(slog.New(slog.NewTextHandler(io.Discard, nil)), p, s)
+	return server.New(slog.New(slog.NewTextHandler(io.Discard, nil)), p, s, "tasks.pending")
 }
 
 func newTestServerOK(t *testing.T) *server.DispatchServer {
@@ -303,7 +339,7 @@ func TestSubmitTask_PublishSuccess(t *testing.T) {
 	}
 }
 
-func TestSubmitTask_PublishFailure(t *testing.T) {
+func TestSubmitTask_PublishFailureRetainsPending(t *testing.T) {
 	t.Parallel()
 
 	prod := &mockProducer{err: errors.New("kafka unavailable")}
@@ -318,12 +354,11 @@ func TestSubmitTask_PublishFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if got := status.Code(err); got != codes.Internal {
-		t.Errorf("error code = %v, want Internal", got)
+	if got := status.Code(err); got != codes.Unavailable {
+		t.Errorf("error code = %v, want Unavailable", got)
 	}
 
-	// Verify rollback: submitting the same key again must NOT be treated as
-	// idempotent — the task was rolled back — and must call Publish a second time.
+	// A duplicate does not race the retained intent's recovery publisher.
 	prod.err = nil
 	resp2, err := srv.SubmitTask(context.Background(), &taskv1.SubmitTaskRequest{
 		Task: &taskv1.Task{
@@ -331,14 +366,11 @@ func TestSubmitTask_PublishFailure(t *testing.T) {
 			Type:           "email_dispatch",
 		},
 	})
-	if err != nil {
-		t.Fatalf("re-submit after rollback: %v", err)
+	if status.Code(err) != codes.Unavailable || resp2 != nil {
+		t.Errorf("pending duplicate must be unavailable: response=%v error=%v", resp2, err)
 	}
-	if resp2.GetStatus() != taskv1.SubmitStatus_SUBMIT_STATUS_ACCEPTED {
-		t.Errorf("re-submit status = %v, want ACCEPTED", resp2.GetStatus())
-	}
-	if prod.calls != 2 {
-		t.Errorf("Publish called %d times total, want 2", prod.calls)
+	if prod.calls != 1 {
+		t.Errorf("Publish called %d times total, want 1", prod.calls)
 	}
 }
 
@@ -364,6 +396,19 @@ func TestSubmitTask_IdempotentResubmitSkipsPublish(t *testing.T) {
 
 	if prod.calls != 1 {
 		t.Errorf("Publish called %d times, want exactly 1 (idempotent resubmit must skip publish)", prod.calls)
+	}
+}
+
+func TestSubmitTask_LegacyRecordIsNotAssumedPublished(t *testing.T) {
+	store := newMockStore()
+	if err := store.SaveTask(context.Background(), state.TaskRecord{ID: "legacy", TaskType: "simulation"}); err != nil {
+		t.Fatal(err)
+	}
+	producer := &mockProducer{}
+	response, err := newTestServer(t, producer, store).SubmitTask(context.Background(),
+		&taskv1.SubmitTaskRequest{Task: &taskv1.Task{IdempotencyKey: "legacy", Type: "simulation"}})
+	if status.Code(err) != codes.FailedPrecondition || response != nil || producer.calls != 0 {
+		t.Fatalf("legacy record was assumed published: response=%v error=%v calls=%d", response, err, producer.calls)
 	}
 }
 

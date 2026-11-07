@@ -40,10 +40,14 @@ Kafka consumer groups resume from committed offsets. The worker stops on process
 
 Execution can repeat if a worker exits after doing work but before recording completion. Replayed tasks already recorded COMPLETED are acknowledged without another execution. There is no exactly-once execution guarantee. Old Redis lock keys do not suppress replay or acknowledge unfinished work.
 
-Task creation is atomic, so competing first submissions cannot overwrite each
-other's record. Sequential submissions sharing an `idempotency_key` return the
-original `task_id`; in-flight duplicate acceptance and publication recovery
-remain open issues.
+Task creation and a retained publication intent are atomic. `ACCEPTED` requires
+both a Kafka acknowledgment and Redis confirmation of publication. A duplicate
+whose original publication is pending returns gRPC `Unavailable`; it does not
+publish a replacement payload. Retry with the same task ID/idempotency key.
+Publication errors and cancelled requests retain the original intent instead of
+rolling back the canonical task. A legacy record without publication evidence
+returns `FailedPrecondition` and needs inspection; it is not assumed published.
+Automatic recovery of retained intents is not yet active.
 
 ### Dead-Letter Queue (DLQ) for Poison-Pill Tasks
 

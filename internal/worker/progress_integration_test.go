@@ -25,7 +25,7 @@ import (
 // closeProgressStore makes the real server's Redis client fail exactly when it
 // persists the selected update. The worker uses its own healthy Redis client.
 type closeProgressStore struct {
-	state.TaskStore
+	state.PublicationStore
 	client *redis.Client
 	status int32
 	closed atomic.Bool
@@ -35,7 +35,7 @@ func (s *closeProgressStore) UpdateProgress(ctx context.Context, id string, stat
 	if status == s.status && !s.closed.Swap(true) {
 		s.client.Close()
 	}
-	return s.TaskStore.UpdateProgress(ctx, id, status, progress)
+	return s.PublicationStore.UpdateProgress(ctx, id, status, progress)
 }
 
 func TestConsumer_ProgressRejectionPreservesKafkaOffset(t *testing.T) {
@@ -65,13 +65,13 @@ func TestConsumer_ProgressRejectionPreservesKafkaOffset(t *testing.T) {
 			}
 
 			serverClient := testutil.RedisClient(t)
-			failing := &closeProgressStore{TaskStore: state.NewRedisTaskStore(serverClient), client: serverClient, status: int32(rejected)}
+			failing := &closeProgressStore{PublicationStore: state.NewRedisTaskStore(serverClient), client: serverClient, status: int32(rejected)}
 			listener, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
 			}
 			grpcServer := grpc.NewServer()
-			taskv1.RegisterDispatchServiceServer(grpcServer, server.New(logger, producer, failing))
+			taskv1.RegisterDispatchServiceServer(grpcServer, server.New(logger, producer, failing, topic))
 			go grpcServer.Serve(listener)
 			t.Cleanup(grpcServer.Stop)
 			reporter, err := NewProgressReporter(ctx, listener.Addr().String(), logger)

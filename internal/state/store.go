@@ -17,17 +17,38 @@ var ErrTaskExists = errors.New("task already exists")
 // ErrTaskCompleted rejects progress changes to an already completed task.
 var ErrTaskCompleted = errors.New("task already completed")
 
+var ErrPublicationLeaseLost = errors.New("publication lease lost")
+
 // TaskRecord is the canonical storage model for a task.
 // It uses primitive types so the state package has no dependency on proto-generated code.
 type TaskRecord struct {
-	ID         string
-	TaskType   string
-	Priority   int32
-	MaxRetries int32
-	Status     int32
-	Progress   int32
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	ID               string
+	TaskType         string
+	Priority         int32
+	MaxRetries       int32
+	Status           int32
+	Progress         int32
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	PublicationState string
+	PublicationTopic string
+}
+
+// Publication retains the original wire task and its destination until the
+// broker acknowledgment has been confirmed in Redis. Owner fences Redis state
+// changes; it cannot fence a Kafka write after an ambiguous timeout.
+type Publication struct {
+	ID      string
+	Topic   string
+	Payload []byte
+	Owner   string
+}
+
+type PublicationStore interface {
+	TaskStore
+	AdmitTask(ctx context.Context, record TaskRecord, publication Publication, lease time.Duration) error
+	ConfirmPublication(ctx context.Context, publication Publication) error
+	ReleasePublication(ctx context.Context, publication Publication, retryDelay time.Duration) error
 }
 
 // TaskStore defines the persistence operations required by the dispatch server.

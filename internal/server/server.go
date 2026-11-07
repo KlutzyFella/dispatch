@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	taskv1 "github.com/ronnitchopra/dispatch/gen/task/v1"
 	"github.com/ronnitchopra/dispatch/internal/broker"
@@ -25,16 +26,18 @@ type DispatchServer struct {
 
 	logger   *slog.Logger
 	producer broker.Producer
-	store    state.TaskStore
+	store    state.PublicationStore
+	topic    string
 }
 
 // New returns a new DispatchServer ready to serve.
 // producer and store must not be nil; inject no-op or mock implementations in tests.
-func New(logger *slog.Logger, producer broker.Producer, store state.TaskStore) *DispatchServer {
+func New(logger *slog.Logger, producer broker.Producer, store state.PublicationStore, topic string) *DispatchServer {
 	return &DispatchServer{
 		logger:   logger,
 		producer: producer,
 		store:    store,
+		topic:    topic,
 	}
 }
 
@@ -72,6 +75,15 @@ func (s *DispatchServer) SubmitTask(ctx context.Context, req *taskv1.SubmitTaskR
 		return nil, status.Errorf(codes.Internal, "failed to check task state")
 	}
 	if err == nil {
+		if existing.PublicationState != "pending" && existing.PublicationState != "published" {
+			return nil, status.Errorf(codes.FailedPrecondition, "task %q has no publication evidence; inspect the legacy record", taskID)
+		}
+		if existing.PublicationTopic != s.topic {
+			return nil, status.Errorf(codes.FailedPrecondition, "task %q belongs to a different publication topic", taskID)
+		}
+		if existing.PublicationState != "published" {
+			return nil, pendingPublication(taskID)
+		}
 		s.logger.InfoContext(ctx, "idempotent resubmission",
 			slog.String("task_id", existing.ID),
 			slog.String("type", existing.TaskType),
@@ -84,6 +96,10 @@ func (s *DispatchServer) SubmitTask(ctx context.Context, req *taskv1.SubmitTaskR
 	}
 
 	now := time.Now()
+	payload, err := proto.MarshalOptions{Deterministic: true}.Marshal(task)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "task cannot be encoded")
+	}
 	record := state.TaskRecord{
 		ID:         taskID,
 		TaskType:   task.GetType(),
@@ -95,9 +111,10 @@ func (s *DispatchServer) SubmitTask(ctx context.Context, req *taskv1.SubmitTaskR
 		UpdatedAt:  now,
 	}
 
-	if err := s.store.SaveTask(ctx, record); err != nil {
+	publication := state.Publication{ID: taskID, Topic: s.topic, Payload: payload, Owner: uuid.NewString()}
+	if err := s.store.AdmitTask(ctx, record, publication, publicationLease); err != nil {
 		if errors.Is(err, state.ErrTaskExists) {
-			return nil, status.Errorf(codes.Unavailable, "task %q admission is in progress; retry with the same idempotency key", taskID)
+			return nil, pendingPublication(taskID)
 		}
 		s.logger.ErrorContext(ctx, "failed to save task to store",
 			slog.String("task_id", taskID),
@@ -107,21 +124,13 @@ func (s *DispatchServer) SubmitTask(ctx context.Context, req *taskv1.SubmitTaskR
 		return nil, status.Errorf(codes.Internal, "failed to save task")
 	}
 
-	if err := s.producer.Publish(ctx, taskID, task); err != nil {
-		// Best-effort rollback: remove the stored record so the key is not
-		// treated as idempotent on a subsequent retry.
-		if delErr := s.store.DeleteTask(ctx, taskID); delErr != nil {
-			s.logger.ErrorContext(ctx, "rollback DeleteTask failed",
-				slog.String("task_id", taskID),
-				slog.String("error", delErr.Error()),
-			)
-		}
-		s.logger.ErrorContext(ctx, "failed to publish task — rolling back store",
+	if _, err := s.publishIntent(ctx, publication); err != nil {
+		s.logger.ErrorContext(ctx, "task publication remains pending",
 			slog.String("task_id", taskID),
 			slog.String("error", err.Error()),
 		)
 		metrics.TasksSubmittedTotal.WithLabelValues("rejected").Inc()
-		return nil, status.Errorf(codes.Internal, "failed to publish task")
+		return nil, pendingPublication(taskID)
 	}
 
 	s.logger.InfoContext(ctx, "task accepted",
