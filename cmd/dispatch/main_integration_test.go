@@ -34,10 +34,11 @@ func TestDispatch_ShutdownWithProgressStream(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			redis := testutil.RedisClient(t)
+			addr, topic := testutil.KafkaTopic(t)
 			port, metricsPort := testutil.UnusedTCPPort(t), testutil.UnusedTCPPort(t)
 			process := testutil.StartMainProcess(t, map[string]string{
 				"PORT": port, "METRICS_PORT": metricsPort,
-				"REDIS_ADDR": redis.Options().Addr, "KAFKA_BROKER": "127.0.0.1:1",
+				"REDIS_ADDR": redis.Options().Addr, "KAFKA_BROKER": addr, "KAFKA_TOPIC": topic,
 			})
 			conn, err := grpc.NewClient("127.0.0.1:"+port, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
@@ -145,4 +146,33 @@ func TestDispatch_FailsWhenMetricsPortOccupied(t *testing.T) {
 		t.Fatalf("failed startup left gRPC port %s occupied: %v", port, err)
 	}
 	listener.Close()
+}
+
+func TestDispatch_RejectsUnavailableKafka(t *testing.T) {
+	if testutil.MainProcessChild() {
+		main()
+		return
+	}
+	redis := testutil.RedisClient(t)
+	port := testutil.UnusedTCPPort(t)
+	process := testutil.StartMainProcess(t, map[string]string{
+		"PORT": port, "METRICS_PORT": testutil.UnusedTCPPort(t),
+		"REDIS_ADDR": redis.Options().Addr, "KAFKA_BROKER": "127.0.0.1:1",
+	})
+	exitErr, exited := process.Wait(3 * time.Second)
+	if !exited {
+		t.Error("dispatch started despite unavailable Kafka")
+		if err := process.Signal(syscall.SIGTERM); err != nil {
+			t.Fatal(err)
+		}
+		exitErr, exited = process.Wait(8 * time.Second)
+	}
+	var exit *exec.ExitError
+	if !exited || !errors.As(exitErr, &exit) || exit.ExitCode() != 1 {
+		t.Errorf("Kafka readiness failure must exit 1: exited=%v error=%v", exited, exitErr)
+	}
+	logs := process.Logs(t)
+	if !strings.Contains(logs, "checking Kafka readiness") || !strings.Contains(logs, "127.0.0.1:1") {
+		t.Errorf("startup did not identify the unavailable broker:\n%s", logs)
+	}
 }

@@ -27,6 +27,13 @@ Both services honor `KAFKA_TOPIC` for the pending-work topic; its default is
 `tasks.pending`. Set the same value on dispatch and worker. The DLQ remains
 `tasks.dead_letter`.
 
+Both services require Redis PING and a Kafka metadata response during startup.
+The Kafka probe has a ten-second deadline. Dispatch opens its gRPC listener only
+after that check, and the worker checks before consuming. The gRPC health status
+is a startup snapshot, not continuous dependency monitoring. This probe does not
+create topics or verify publishing permissions; topic provisioning remains a
+startup-orchestration requirement.
+
 ### Delivery and Replay
 
 Kafka consumer groups resume from committed offsets. The worker stops on processing errors so a later commit cannot pass unresolved work. A new consumer session can fetch that work again.

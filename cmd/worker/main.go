@@ -101,6 +101,9 @@ func run(logger *slog.Logger) error {
 	if err := metrics.StartServer(ctx, ":"+metricsPort, logger); err != nil {
 		return fmt.Errorf("starting metrics server: %w", err)
 	}
+	if err := broker.CheckReady(ctx, kafkaBroker); err != nil {
+		return err
+	}
 
 	// ── Kafka consumer ─────────────────────────────────────────────────────────
 	consumer := worker.NewConsumer(

@@ -94,6 +94,9 @@ func run(logger *slog.Logger, port string) error {
 	if err := metrics.StartServer(ctx, ":"+metricsPort, logger); err != nil {
 		return fmt.Errorf("starting metrics server: %w", err)
 	}
+	if err := broker.CheckReady(ctx, kafkaBroker); err != nil {
+		return err
+	}
 
 	// ── gRPC server ────────────────────────────────────────────────────────────
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
