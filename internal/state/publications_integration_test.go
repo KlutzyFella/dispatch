@@ -99,3 +99,96 @@ func TestRedisStore_PublicationAdmission_Integration(t *testing.T) {
 		}
 	})
 }
+
+func TestRedisStore_PublicationClaim_Integration(t *testing.T) {
+	t.Run("one_recovery_owner", func(t *testing.T) {
+		store, _, record, p := pendingPublication(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := store.AdmitTask(ctx, record, p, time.Second); err != nil {
+			t.Fatal(err)
+		}
+		if claimed, err := store.ClaimPublication(ctx, p.Topic, uuid.NewString(), time.Second); err != nil || claimed != nil {
+			t.Fatalf("active owner was stolen: %+v %v", claimed, err)
+		}
+		if err := store.ReleasePublication(ctx, p, 0); err != nil {
+			t.Fatal(err)
+		}
+		type result struct {
+			p   *state.Publication
+			err error
+		}
+		results := make(chan result, 16)
+		for i := 0; i < cap(results); i++ {
+			go func() {
+				claimed, err := store.ClaimPublication(ctx, p.Topic, uuid.NewString(), 5*time.Second)
+				results <- result{claimed, err}
+			}()
+		}
+		var winner *state.Publication
+		owners := 0
+		for i := 0; i < cap(results); i++ {
+			result := <-results
+			if result.err != nil {
+				t.Errorf("claim failed: %v", result.err)
+			}
+			if result.p != nil {
+				winner = result.p
+				owners++
+			}
+		}
+		if owners != 1 || winner.ID != p.ID || !bytes.Equal(winner.Payload, p.Payload) {
+			t.Fatalf("recovery ownership was not exclusive: owners=%d winner=%+v", owners, winner)
+		}
+		if err := store.ConfirmPublication(ctx, p); !errors.Is(err, state.ErrPublicationLeaseLost) {
+			t.Fatalf("stale owner confirmed a takeover: %v", err)
+		}
+		if err := store.ConfirmPublication(ctx, *winner); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("expired_owner_can_be_recovered", func(t *testing.T) {
+		store, _, record, p := pendingPublication(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := store.AdmitTask(ctx, record, p, 20*time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			claimed, err := store.ClaimPublication(ctx, p.Topic, "replacement", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if claimed != nil {
+				if claimed.ID != p.ID || claimed.Owner != "replacement" {
+					t.Fatalf("wrong recovered intent: %+v", claimed)
+				}
+				break
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatal("expired publication never became eligible")
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	})
+	t.Run("corruption_fails_without_discarding_intent", func(t *testing.T) {
+		store, client, record, p := pendingPublication(t)
+		ctx := context.Background()
+		if err := store.AdmitTask(ctx, record, p, time.Second); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.ReleasePublication(ctx, p, 0); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.HDel(ctx, "publication:"+p.ID, "payload").Err(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ClaimPublication(ctx, p.Topic, "replacement", time.Second); err == nil {
+			t.Fatal("corrupt intent was silently ignored")
+		}
+		if _, err := client.ZScore(ctx, "outbox:"+p.Topic, p.ID).Result(); err != nil {
+			t.Fatalf("corrupt intent was discarded: %v", err)
+		}
+	})
+}

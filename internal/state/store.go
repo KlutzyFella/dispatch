@@ -49,6 +49,7 @@ type PublicationStore interface {
 	AdmitTask(ctx context.Context, record TaskRecord, publication Publication, lease time.Duration) error
 	ConfirmPublication(ctx context.Context, publication Publication) error
 	ReleasePublication(ctx context.Context, publication Publication, retryDelay time.Duration) error
+	ClaimPublication(ctx context.Context, topic, owner string, lease time.Duration) (*Publication, error)
 }
 
 // TaskStore defines the persistence operations required by the dispatch server.

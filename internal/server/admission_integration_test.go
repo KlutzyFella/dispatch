@@ -139,6 +139,72 @@ func (p *acknowledgedPublication) Publish(context.Context, string, *taskv1.Task)
 }
 func (*acknowledgedPublication) Close() error { return nil }
 
+type retryingPublication struct {
+	next  broker.Producer
+	calls atomic.Int32
+}
+
+func (p *retryingPublication) Publish(ctx context.Context, id string, task *taskv1.Task) error {
+	if p.calls.Add(1) <= 2 {
+		return errors.New("temporary broker failure")
+	}
+	return p.next.Publish(ctx, id, task)
+}
+func (p *retryingPublication) Close() error { return p.next.Close() }
+
+func TestPublicationRecovery_RetriesBrokerFailure(t *testing.T) {
+	addr, topic := testutil.KafkaTopic(t)
+	client := testutil.RedisClient(t)
+	store := state.NewRedisTaskStore(client)
+	t.Cleanup(func() { client.Del(context.Background(), "task:"+topic, "publication:"+topic, "outbox:"+topic) })
+	producer := &retryingPublication{next: broker.NewKafkaProducer(addr, topic, slog.New(slog.NewTextHandler(io.Discard, nil)))}
+	defer producer.Close()
+	srv := admissionServer(t, producer, store, topic)
+	task := &taskv1.Task{IdempotencyKey: topic, Type: "original", Payload: []byte("recovered unchanged")}
+	if _, err := srv.SubmitTask(context.Background(), &taskv1.SubmitTaskRequest{Task: task}); status.Code(err) != codes.Unavailable {
+		t.Fatalf("failed first publication was accepted: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.RecoverPublications(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(4 * time.Second):
+			t.Error("recovery did not stop")
+		}
+	})
+	reader := kafka.NewReader(kafka.ReaderConfig{Brokers: []string{addr}, Topic: topic, Partition: 0, MinBytes: 1, MaxBytes: 10e6})
+	defer reader.Close()
+	message, err := reader.ReadMessage(ctx)
+	if err != nil {
+		t.Fatalf("temporary recovery error lost the retained task: %v", err)
+	}
+	var got taskv1.Task
+	if err := proto.Unmarshal(message.Value, &got); err != nil || !proto.Equal(task, &got) {
+		t.Fatalf("recovery changed payload: %v error=%v", &got, err)
+	}
+	for {
+		if record, err := store.GetTask(ctx, topic); err == nil && record.PublicationState == "published" {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("recovery never confirmed publication")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if producer.calls.Load() != 3 {
+		t.Fatalf("unexpected publish attempts: %d", producer.calls.Load())
+	}
+	response, err := srv.SubmitTask(ctx, &taskv1.SubmitTaskRequest{Task: task})
+	if err != nil || response.GetStatus() != taskv1.SubmitStatus_SUBMIT_STATUS_ACCEPTED {
+		t.Fatalf("confirmed recovery was not accepted: %v %v", response, err)
+	}
+}
+
 func TestSubmitTask_ConfirmationSurvivesRequestCancellation(t *testing.T) {
 	client := testutil.RedisClient(t)
 	id := "confirmed-admission-" + uuid.NewString()

@@ -64,6 +64,37 @@ redis.call('ZADD', KEYS[3], now + tonumber(ARGV[4]), ARGV[1])
 return 1
 `)
 
+var claimPublication = redis.NewScript(`
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now, 'LIMIT', 0, 1)
+if #ids == 0 then return {} end
+local id = ids[1]
+local taskKey = ARGV[1] .. id
+local publicationKey = ARGV[2] .. id
+if redis.call('HGET', taskKey, 'publication_state') ~= 'pending' then
+    return redis.error_reply('indexed publication has no pending canonical task')
+end
+if redis.call('HGET', taskKey, 'publication_topic') ~= ARGV[3] or
+   redis.call('HGET', publicationKey, 'topic') ~= ARGV[3] or
+   redis.call('HGET', publicationKey, 'id') ~= id then
+    return redis.error_reply('publication destination or identity mismatch')
+end
+local payload = redis.call('HGET', publicationKey, 'payload')
+local untilTime = tonumber(redis.call('HGET', publicationKey, 'until'))
+if not payload or not untilTime then
+    return redis.error_reply('publication payload or lease is missing')
+end
+if untilTime > now then
+    redis.call('ZADD', KEYS[1], untilTime, id)
+    return {}
+end
+local newUntil = now + tonumber(ARGV[5])
+redis.call('HSET', publicationKey, 'owner', ARGV[4], 'until', newUntil)
+redis.call('ZADD', KEYS[1], newUntil, id)
+return {id, payload}
+`)
+
 func publicationKeys(p Publication) []string {
 	return []string{taskKeyPrefix + p.ID, publicationKeyPrefix + p.ID, outboxKeyPrefix + p.Topic}
 }
@@ -111,4 +142,29 @@ func publicationResult(operation, id string, result int64, err error) error {
 		return ErrPublicationLeaseLost
 	}
 	return nil
+}
+
+// ClaimPublication atomically leases the next due intent for this topic. Redis
+// time governs eligibility, so dispatch instances do not compare local clocks.
+func (s *RedisTaskStore) ClaimPublication(ctx context.Context, topic, owner string, lease time.Duration) (*Publication, error) {
+	if topic == "" || owner == "" || lease.Milliseconds() < 1 {
+		return nil, fmt.Errorf("invalid publication recovery claim")
+	}
+	values, err := claimPublication.Run(ctx, s.client, []string{outboxKeyPrefix + topic},
+		taskKeyPrefix, publicationKeyPrefix, topic, owner, lease.Milliseconds()).Slice()
+	if err != nil {
+		return nil, fmt.Errorf("claiming publication for topic %q: %w", topic, err)
+	}
+	if len(values) == 0 {
+		return nil, nil
+	}
+	if len(values) != 2 {
+		return nil, fmt.Errorf("invalid publication claim response")
+	}
+	id, idOK := values[0].(string)
+	payload, payloadOK := values[1].(string)
+	if !idOK || !payloadOK {
+		return nil, fmt.Errorf("invalid publication claim types")
+	}
+	return &Publication{ID: id, Topic: topic, Payload: []byte(payload), Owner: owner}, nil
 }

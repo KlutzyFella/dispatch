@@ -137,6 +137,23 @@ func (m *mockTaskStore) ReleasePublication(ctx context.Context, p state.Publicat
 	return nil
 }
 
+func (m *mockTaskStore) ClaimPublication(ctx context.Context, topic, owner string, _ time.Duration) (*state.Publication, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if m.getErr != nil {
+		return nil, m.getErr
+	}
+	for id, p := range m.publications {
+		if p.Topic == topic && p.Owner == "" {
+			p.Owner = owner
+			m.publications[id] = p
+			return &p, nil
+		}
+	}
+	return nil, nil
+}
+
 var _ state.PublicationStore = (*mockTaskStore)(nil)
 
 // ── Test helpers ──────────────────────────────────────────────────────────────

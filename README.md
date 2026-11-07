@@ -47,7 +47,26 @@ publish a replacement payload. Retry with the same task ID/idempotency key.
 Publication errors and cancelled requests retain the original intent instead of
 rolling back the canonical task. A legacy record without publication evidence
 returns `FailedPrecondition` and needs inspection; it is not assumed published.
-Automatic recovery of retained intents is not yet active.
+
+Dispatch runs a supervised publication-recovery loop. Pending intents retain the
+original protobuf payload and topic; a topic-scoped Redis index schedules retries.
+Redis time and owner tokens fence claims and confirmations. A live owner has a
+15-second lease; publication attempts have a ten-second timeout. Failed writes
+are deferred by one second, and idle recovery polls every 200 ms. These are
+internal policies, not performance measurements.
+
+After a dispatch crash, expired intents are retried and confirmed only after a
+Kafka ACK. A crash or ambiguous timeout after Kafka receives a record can cause
+duplicate delivery. `Unavailable` therefore does not guarantee that no work was
+queued or executed; always retry with the same idempotency key. Once published,
+a duplicate returns the original ID and does not replace the canonical payload.
+Changing `KAFKA_TOPIC` does not reroute old pending intents. Redis should be
+isolated per Kafka environment; the intent binds a topic, not a Kafka cluster ID.
+
+Recovery requires retained Redis data. The current Compose file does not establish
+crash-safe Redis persistence, and no guarantee against Redis data loss is claimed.
+Corrupt intent/index data or recovery storage failures stop dispatch with an
+error rather than leave a healthy-looking service with a dead recovery loop.
 
 ### Dead-Letter Queue (DLQ) for Poison-Pill Tasks
 

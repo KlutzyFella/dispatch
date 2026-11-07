@@ -59,7 +59,7 @@ func run(logger *slog.Logger, port string) error {
 	redisAddr := envOrDefault(redisAddrEnvVar, defaultRedisAddr)
 
 	// ── Redis ──────────────────────────────────────────────────────────────────
-	redisClient := redis.NewClient(&redis.Options{Addr: redisAddr})
+	redisClient := redis.NewClient(&redis.Options{Addr: redisAddr, ContextTimeoutEnabled: true})
 	defer func() {
 		if err := redisClient.Close(); err != nil {
 			logger.Error("redis client close error", slog.String("error", err.Error()))
@@ -105,6 +105,7 @@ func run(logger *slog.Logger, port string) error {
 	}
 
 	grpcSrv := grpc.NewServer()
+	defer grpcSrv.Stop()
 
 	dispatchSrv := server.New(logger, producer, taskStore, kafkaTopic)
 	taskv1.RegisterDispatchServiceServer(grpcSrv, dispatchSrv)
@@ -115,7 +116,18 @@ func run(logger *slog.Logger, port string) error {
 
 	reflection.Register(grpcSrv)
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 2)
+	recoveryDone := make(chan struct{})
+	go func() {
+		defer close(recoveryDone)
+		if err := dispatchSrv.RecoverPublications(ctx); err != nil {
+			errCh <- err
+		}
+	}()
+	defer func() {
+		stop()
+		<-recoveryDone
+	}()
 	go func() {
 		logger.Info("dispatch gRPC server listening",
 			slog.String("port", port),

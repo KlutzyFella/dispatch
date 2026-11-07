@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
 	taskv1 "github.com/ronnitchopra/dispatch/gen/task/v1"
 	"github.com/ronnitchopra/dispatch/internal/state"
 	"google.golang.org/grpc/codes"
@@ -22,6 +24,48 @@ const (
 
 func pendingPublication(id string) error {
 	return status.Errorf(codes.Unavailable, "task %q publication is pending; retry using this task ID as the idempotency key", id)
+}
+
+// RecoverPublications retries due intents until cancellation. Broker errors
+// retain and defer an intent; corrupt state or persistence failures return an
+// error so the service cannot keep running with a broken recovery component.
+func (s *DispatchServer) RecoverPublications(ctx context.Context) error {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		claimCtx, stopClaim := context.WithTimeout(ctx, publicationFinalizeTimeout)
+		p, err := s.store.ClaimPublication(claimCtx, s.topic, uuid.NewString(), publicationLease)
+		stopClaim()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("publication recovery: %w", err)
+		}
+		if p != nil {
+			retryable, err := s.publishIntent(ctx, *p)
+			if ctx.Err() != nil {
+				return nil
+			}
+			if err != nil {
+				if !retryable {
+					return fmt.Errorf("publication recovery: %w", err)
+				}
+				s.logger.Error("publication recovery will retry", slog.String("task_id", p.ID), slog.String("error", err.Error()))
+			} else {
+				s.logger.Info("publication recovered", slog.String("task_id", p.ID), slog.String("topic", p.Topic))
+			}
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
 }
 
 // publishIntent returns retryable=true only for a broker error whose intent was
