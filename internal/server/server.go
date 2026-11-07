@@ -159,7 +159,15 @@ func (s *DispatchServer) ReportProgress(stream taskv1.DispatchService_ReportProg
 // applyProgressUpdate validates a single progress update and, if valid, writes
 // it to the task store.
 func (s *DispatchServer) applyProgressUpdate(ctx context.Context, update *taskv1.ProgressUpdate) *taskv1.ProgressAck {
-	if update.GetProgress() < 0 || update.GetProgress() > 100 {
+	switch update.GetStatus() {
+	case taskv1.TaskStatus_TASK_STATUS_RUNNING, taskv1.TaskStatus_TASK_STATUS_COMPLETED, taskv1.TaskStatus_TASK_STATUS_FAILED:
+	default:
+		s.logger.WarnContext(ctx, "unsupported worker progress status", slog.String("task_id", update.GetTaskId()),
+			slog.String("status", update.GetStatus().String()))
+		return &taskv1.ProgressAck{Recorded: false}
+	}
+	if update.GetProgress() < 0 || update.GetProgress() > 100 ||
+		(update.GetStatus() == taskv1.TaskStatus_TASK_STATUS_COMPLETED && update.GetProgress() != 100) {
 		s.logger.WarnContext(ctx, "invalid progress value — ignoring",
 			slog.String("worker_id", update.GetWorkerId()),
 			slog.String("task_id", update.GetTaskId()),

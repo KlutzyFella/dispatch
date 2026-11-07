@@ -67,6 +67,11 @@ The worker closes its reader and exits nonzero on that error. This prevents a la
 
 Progress updates require `recorded=true`, including FAILED updates for exhausted replays. A successful gRPC exchange with `recorded=false` means the state update was rejected: the worker stops with an error and leaves the source message uncommitted. Transport errors also stop consumption. A started attempt remains counted; rejecting RUNNING prevents work, while rejecting COMPLETED can occur after work has already happened.
 
+Worker progress accepts RUNNING, FAILED, and COMPLETED only, with percentages
+in 0–100; COMPLETED requires exactly 100. PENDING is assigned by submission,
+and cancellation is not implemented. Unsupported statuses are rejected without
+changing the task record.
+
 Redis checks task existence and writes progress atomically. If deletion wins before the update, the update is rejected without recreating a partial task record. This does not enforce lifecycle transition ordering.
 
 ---

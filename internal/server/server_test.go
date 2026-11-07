@@ -563,3 +563,48 @@ func TestReportProgress_StoreUpdateFailure(t *testing.T) {
 		t.Error("expected recorded=false when store.UpdateProgress fails")
 	}
 }
+
+func TestReportProgress_RejectsUnsupportedState(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   taskv1.TaskStatus
+		progress int32
+		accepted bool
+	}{
+		{name: "unspecified"},
+		{name: "unknown", status: taskv1.TaskStatus(999)},
+		{name: "negative_status", status: taskv1.TaskStatus(-1)},
+		{name: "pending_is_not_worker_progress", status: taskv1.TaskStatus_TASK_STATUS_PENDING},
+		{name: "cancellation_is_not_implemented", status: taskv1.TaskStatus_TASK_STATUS_CANCELLED},
+		{name: "completed_at_zero", status: taskv1.TaskStatus_TASK_STATUS_COMPLETED},
+		{name: "completed_at_99", status: taskv1.TaskStatus_TASK_STATUS_COMPLETED, progress: 99},
+		{name: "running", status: taskv1.TaskStatus_TASK_STATUS_RUNNING, progress: 42, accepted: true},
+		{name: "failed", status: taskv1.TaskStatus_TASK_STATUS_FAILED, accepted: true},
+		{name: "completed", status: taskv1.TaskStatus_TASK_STATUS_COMPLETED, progress: 100, accepted: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			store := newMockStore()
+			srv := newTestServer(t, &mockProducer{}, store)
+			id := submitTask(t, srv, "simulation")
+			before := store.tasks[id]
+			stream := newStream(context.Background(), &taskv1.ProgressUpdate{
+				WorkerId: "test-worker", TaskId: id, Status: tc.status, Progress: tc.progress,
+			})
+			if err := srv.ReportProgress(stream); err != nil {
+				t.Fatal(err)
+			}
+			if len(stream.acks) != 1 || stream.acks[0].GetRecorded() != tc.accepted {
+				t.Errorf("acknowledgment=%v, want recorded=%v", stream.acks, tc.accepted)
+			}
+			after := store.tasks[id]
+			if !tc.accepted && after != before {
+				t.Errorf("invalid progress changed task state: before=%+v after=%+v", before, after)
+			}
+			if tc.accepted && (after.Status != int32(tc.status) || after.Progress != tc.progress) {
+				t.Errorf("valid progress was not stored: %+v", after)
+			}
+		})
+	}
+}
