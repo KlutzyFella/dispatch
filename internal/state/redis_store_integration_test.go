@@ -1,3 +1,5 @@
+//go:build integration
+
 package state_test
 
 import (
@@ -6,33 +8,20 @@ import (
 	"testing"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	"github.com/google/uuid"
 
 	"github.com/ronnitchopra/dispatch/internal/state"
+	"github.com/ronnitchopra/dispatch/internal/testutil"
 )
-
-// newTestRedisClient returns a Redis client pointed at localhost:6379.
-// Tests using this helper skip themselves if Redis is not reachable.
-func newTestRedisClient(t *testing.T) *redis.Client {
-	t.Helper()
-	client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	if err := client.Ping(ctx).Err(); err != nil {
-		t.Skipf("Redis not available at localhost:6379 — skipping integration test: %v", err)
-	}
-	t.Cleanup(func() { client.Close() })
-	return client
-}
 
 func TestRedisStore_SaveAndGet(t *testing.T) {
 	t.Parallel()
 
-	client := newTestRedisClient(t)
+	client := testutil.RedisClient(t)
 	store := state.NewRedisTaskStore(client)
 	ctx := context.Background()
 
-	id := "redis-test-" + t.Name()
+	id := "redis-test-" + uuid.NewString()
 	t.Cleanup(func() { client.Del(ctx, "task:"+id) })
 
 	record := state.TaskRecord{
@@ -68,10 +57,10 @@ func TestRedisStore_SaveAndGet(t *testing.T) {
 func TestRedisStore_GetTask_NotFound(t *testing.T) {
 	t.Parallel()
 
-	client := newTestRedisClient(t)
+	client := testutil.RedisClient(t)
 	store := state.NewRedisTaskStore(client)
 
-	_, err := store.GetTask(context.Background(), "does-not-exist-ever")
+	_, err := store.GetTask(context.Background(), "absent-"+uuid.NewString())
 	if !errors.Is(err, state.ErrTaskNotFound) {
 		t.Errorf("expected ErrTaskNotFound, got %v", err)
 	}
@@ -80,11 +69,11 @@ func TestRedisStore_GetTask_NotFound(t *testing.T) {
 func TestRedisStore_UpdateProgress(t *testing.T) {
 	t.Parallel()
 
-	client := newTestRedisClient(t)
+	client := testutil.RedisClient(t)
 	store := state.NewRedisTaskStore(client)
 	ctx := context.Background()
 
-	id := "redis-upd-" + t.Name()
+	id := "redis-upd-" + uuid.NewString()
 	t.Cleanup(func() { client.Del(ctx, "task:"+id) })
 
 	record := state.TaskRecord{
@@ -114,10 +103,10 @@ func TestRedisStore_UpdateProgress(t *testing.T) {
 func TestRedisStore_UpdateProgress_NotFound(t *testing.T) {
 	t.Parallel()
 
-	client := newTestRedisClient(t)
+	client := testutil.RedisClient(t)
 	store := state.NewRedisTaskStore(client)
 
-	err := store.UpdateProgress(context.Background(), "ghost-task", 2, 50)
+	err := store.UpdateProgress(context.Background(), "absent-"+uuid.NewString(), 2, 50)
 	if !errors.Is(err, state.ErrTaskNotFound) {
 		t.Errorf("expected ErrTaskNotFound, got %v", err)
 	}
@@ -126,11 +115,11 @@ func TestRedisStore_UpdateProgress_NotFound(t *testing.T) {
 func TestRedisStore_DeleteTask(t *testing.T) {
 	t.Parallel()
 
-	client := newTestRedisClient(t)
+	client := testutil.RedisClient(t)
 	store := state.NewRedisTaskStore(client)
 	ctx := context.Background()
 
-	id := "redis-del-" + t.Name()
+	id := "redis-del-" + uuid.NewString()
 	t.Cleanup(func() { client.Del(ctx, "task:"+id) })
 
 	record := state.TaskRecord{
@@ -153,11 +142,11 @@ func TestRedisStore_DeleteTask(t *testing.T) {
 func TestRedisStore_GetTask_CorruptField(t *testing.T) {
 	t.Parallel()
 
-	client := newTestRedisClient(t)
+	client := testutil.RedisClient(t)
 	store := state.NewRedisTaskStore(client)
 	ctx := context.Background()
 
-	id := "corrupt-" + t.Name()
+	id := "corrupt-" + uuid.NewString()
 	t.Cleanup(func() { client.Del(ctx, "task:"+id) })
 
 	// Write a hash that has a non-numeric "priority" field so parseRecord fails.
