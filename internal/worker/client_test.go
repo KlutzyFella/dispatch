@@ -2,10 +2,16 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"io"
+	"log/slog"
+	"net"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	taskv1 "github.com/ronnitchopra/dispatch/gen/task/v1"
 )
@@ -140,17 +146,30 @@ func TestProgressReporter_Close_ConnError(t *testing.T) {
 	}
 }
 
-func TestNewProgressReporter_InvalidAddr(t *testing.T) {
+// The worker opens its progress stream at startup so that an unreachable
+// dispatch server fails startup instead of the first task. The connection is
+// refused on a local port that was just closed; no external network is used.
+func TestNewProgressReporter_UnreachableServerFailsFast(t *testing.T) {
 	t.Parallel()
-
-	// grpc.NewClient with an invalid target should succeed (lazy dialling),
-	// but OpenStream will fail when trying to reach an unreachable server.
-	// We verify that NewProgressReporter returns an error for an unreachable address.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // pre-cancelled context
-
-	_, err := NewProgressReporter(ctx, "localhost:1", nil)
-	if err == nil {
-		t.Fatal("expected error opening stream to unreachable server, got nil")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	reporter, err := NewProgressReporter(ctx, addr, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if reporter != nil {
+		reporter.Close()
+	}
+	if status.Code(errors.Unwrap(err)) != codes.Unavailable {
+		t.Fatalf("unreachable dispatch server returned %v; want an Unavailable stream error", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("startup took %v to report an unreachable server", elapsed)
 	}
 }
