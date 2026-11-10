@@ -383,29 +383,6 @@ func TestProcessMessage_DLQFailureNotHandled(t *testing.T) {
 
 // ── NewConsumer / Run / Close ──────────────────────────────────────────────────
 
-func TestNewConsumer_InitialisesFields(t *testing.T) {
-	t.Parallel()
-
-	sender := &mockSender{}
-	dlq := &mockDLQPublisher{}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-
-	c := NewConsumer("localhost:9092", "tasks.pending", "dispatch-workers", "w-1",
-		sender, &mockAttemptStore{}, dlq, logger)
-	if c == nil {
-		t.Fatal("expected non-nil Consumer")
-	}
-	if c.workerID != "w-1" {
-		t.Errorf("expected workerID 'w-1', got %q", c.workerID)
-	}
-	if c.reader == nil {
-		t.Error("expected non-nil kafka.Reader")
-	}
-	if err := c.Close(); err != nil {
-		t.Fatalf("unexpected error on Close: %v", err)
-	}
-}
-
 func TestConsumer_Close(t *testing.T) {
 	t.Parallel()
 

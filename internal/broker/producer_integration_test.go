@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -15,6 +17,10 @@ import (
 	"github.com/segmentio/kafka-go"
 	"google.golang.org/protobuf/proto"
 )
+
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
 
 func TestKafkaProducer_Publish_Integration(t *testing.T) {
 	addr, topic := testutil.KafkaTopic(t, kafka.ConfigEntry{

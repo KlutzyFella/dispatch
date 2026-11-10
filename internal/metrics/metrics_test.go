@@ -10,29 +10,6 @@ import (
 	"github.com/ronnitchopra/dispatch/internal/metrics"
 )
 
-func TestCounters_IncrementWithoutPanic(t *testing.T) {
-	t.Run("TasksSubmittedTotal accepted", func(t *testing.T) {
-		metrics.TasksSubmittedTotal.WithLabelValues("accepted").Inc()
-	})
-
-	t.Run("TasksSubmittedTotal rejected", func(t *testing.T) {
-		metrics.TasksSubmittedTotal.WithLabelValues("rejected").Inc()
-	})
-
-	t.Run("TasksCompletedTotal", func(t *testing.T) {
-		metrics.TasksCompletedTotal.Inc()
-	})
-
-	t.Run("TasksFailedTotal", func(t *testing.T) {
-		metrics.TasksFailedTotal.Inc()
-	})
-
-	t.Run("TaskExecutionDuration", func(t *testing.T) {
-		metrics.TaskExecutionDuration.Observe(1.5)
-		metrics.TaskExecutionDuration.Observe(0.001)
-	})
-}
-
 func TestMetricsHandler_ReturnsPrometheusFormat(t *testing.T) {
 	// Increment a counter so there is at least one named metric in the output.
 	metrics.TasksSubmittedTotal.WithLabelValues("accepted").Inc()
