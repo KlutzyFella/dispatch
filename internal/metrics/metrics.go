@@ -7,12 +7,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// TasksSubmittedTotal counts tasks submitted to the server.
-// The "status" label is either "accepted" or "rejected".
+// TasksSubmittedTotal counts SubmitTask responses, not distinct tasks: client
+// retries are counted again. The "status" label is "accepted" (ACCEPTED),
+// "pending" (Unavailable; the intent is retained for recovery), "rejected"
+// (InvalidArgument or FailedPrecondition), or "error" (any other failure).
 var TasksSubmittedTotal = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: "tasks_submitted_total",
-		Help: "Total number of tasks submitted, partitioned by acceptance status.",
+		Help: "SubmitTask responses by outcome: accepted, pending, rejected, or error.",
 	},
 	[]string{"status"},
 )

@@ -193,7 +193,7 @@ Both services expose a `/metrics` endpoint scraped by Prometheus every 15 second
 
 | Metric | Type | Description |
 |---|---|---|
-| `tasks_submitted_total` | Counter | Task submissions, labeled `status=accepted\|rejected` |
+| `tasks_submitted_total` | Counter | SubmitTask responses (retries count again), labeled `status=accepted\|pending\|rejected\|error`; `pending` is Unavailable with the intent retained for recovery |
 | `tasks_completed_total` | Counter | Successfully executed tasks |
 | `tasks_failed_total` | Counter | Failed simulated execution attempts |
 | `task_execution_duration_seconds` | Histogram | Per-attempt simulated execution duration; excludes queue wait |

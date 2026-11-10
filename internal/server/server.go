@@ -42,21 +42,40 @@ func New(logger *slog.Logger, producer broker.Producer, store state.PublicationS
 }
 
 // SubmitTask accepts a task from a client, assigns a canonical ID, and stores it.
+// Each response is counted once by the outcome the client receives.
 func (s *DispatchServer) SubmitTask(ctx context.Context, req *taskv1.SubmitTaskRequest) (*taskv1.SubmitTaskResponse, error) {
+	response, err := s.submitTask(ctx, req)
+	metrics.TasksSubmittedTotal.WithLabelValues(submissionOutcome(err)).Inc()
+	return response, err
+}
+
+// submissionOutcome labels a SubmitTask result. Unavailable is "pending", not a
+// rejection: the intent is retained and recovery may still publish it.
+func submissionOutcome(err error) string {
+	switch status.Code(err) {
+	case codes.OK:
+		return "accepted"
+	case codes.Unavailable:
+		return "pending"
+	case codes.InvalidArgument, codes.FailedPrecondition:
+		return "rejected"
+	default:
+		return "error"
+	}
+}
+
+func (s *DispatchServer) submitTask(ctx context.Context, req *taskv1.SubmitTaskRequest) (*taskv1.SubmitTaskResponse, error) {
 	if req.GetTask() == nil {
-		metrics.TasksSubmittedTotal.WithLabelValues("rejected").Inc()
 		return nil, status.Error(codes.InvalidArgument, "task must not be nil")
 	}
 
 	task := req.GetTask()
 
 	if task.GetType() == "" {
-		metrics.TasksSubmittedTotal.WithLabelValues("rejected").Inc()
 		return nil, status.Error(codes.InvalidArgument, "task.type must not be empty")
 	}
 
 	if task.GetMaxRetries() < 0 {
-		metrics.TasksSubmittedTotal.WithLabelValues("rejected").Inc()
 		return nil, status.Error(codes.InvalidArgument, "task.max_retries must not be negative")
 	}
 
@@ -88,7 +107,6 @@ func (s *DispatchServer) SubmitTask(ctx context.Context, req *taskv1.SubmitTaskR
 			slog.String("task_id", existing.ID),
 			slog.String("type", existing.TaskType),
 		)
-		metrics.TasksSubmittedTotal.WithLabelValues("accepted").Inc()
 		return &taskv1.SubmitTaskResponse{
 			Status: taskv1.SubmitStatus_SUBMIT_STATUS_ACCEPTED,
 			TaskId: existing.ID,
@@ -120,7 +138,6 @@ func (s *DispatchServer) SubmitTask(ctx context.Context, req *taskv1.SubmitTaskR
 			slog.String("task_id", taskID),
 			slog.String("error", err.Error()),
 		)
-		metrics.TasksSubmittedTotal.WithLabelValues("rejected").Inc()
 		return nil, status.Errorf(codes.Internal, "failed to save task")
 	}
 
@@ -129,7 +146,6 @@ func (s *DispatchServer) SubmitTask(ctx context.Context, req *taskv1.SubmitTaskR
 			slog.String("task_id", taskID),
 			slog.String("error", err.Error()),
 		)
-		metrics.TasksSubmittedTotal.WithLabelValues("rejected").Inc()
 		return nil, pendingPublication(taskID)
 	}
 
@@ -140,7 +156,6 @@ func (s *DispatchServer) SubmitTask(ctx context.Context, req *taskv1.SubmitTaskR
 		slog.Int("max_retries", int(task.GetMaxRetries())),
 	)
 
-	metrics.TasksSubmittedTotal.WithLabelValues("accepted").Inc()
 	return &taskv1.SubmitTaskResponse{
 		Status: taskv1.SubmitStatus_SUBMIT_STATUS_ACCEPTED,
 		TaskId: taskID,
