@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/segmentio/kafka-go"
 	"google.golang.org/protobuf/proto"
@@ -26,6 +27,10 @@ type Producer interface {
 	Close() error
 }
 
+// publishBatchTimeout bounds how long a write waits for other messages to join
+// its batch. It is a policy value, not a measured latency.
+const publishBatchTimeout = 10 * time.Millisecond
+
 // KafkaProducer implements Producer using the segmentio/kafka-go library.
 type KafkaProducer struct {
 	writer *kafka.Writer
@@ -42,6 +47,10 @@ func NewKafkaProducer(brokerAddr, topic string, logger *slog.Logger) *KafkaProdu
 		Balancer:               &kafka.Hash{},    // route by key hash for partition consistency
 		RequiredAcks:           kafka.RequireAll, // surface broker rejections before accepting work
 		AllowAutoTopicCreation: true,
+		// Publish is synchronous and callers wait on it. kafka-go's 1s default
+		// would hold each lone message for a batch that never fills; a short
+		// window still lets concurrent submissions share a request.
+		BatchTimeout: publishBatchTimeout,
 	}
 	return &KafkaProducer{writer: w, logger: logger}
 }

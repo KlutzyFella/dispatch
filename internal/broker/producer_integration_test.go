@@ -91,3 +91,41 @@ func assertMessageTooLarge(t *testing.T, err error) {
 		t.Fatalf("Publish must report Kafka's MessageSizeTooLarge rejection, got %v", err)
 	}
 }
+
+// Publish is synchronous and SubmitTask waits for it, so the writer must not
+// hold a lone message waiting for a batch to fill. kafka-go's default
+// BatchTimeout is one second; with it every single-message Publish to a
+// healthy local broker took about 1.0s. The bound is deliberately loose: it
+// separates "waits for a batch timer" from "waits for the broker ACK", and is
+// not a latency claim.
+func TestKafkaProducer_PublishDoesNotWaitForBatchTimer(t *testing.T) {
+	addr, topic := testutil.KafkaTopic(t)
+	p := broker.NewKafkaProducer(addr, topic, testLogger())
+	t.Cleanup(func() {
+		if err := p.Close(); err != nil {
+			t.Errorf("closing producer: %v", err)
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	task := &taskv1.Task{Type: "simulation"}
+	// Warm up connection and topic metadata outside the measurement.
+	if err := testutil.RetryKafkaMetadata(ctx, func() error { return p.Publish(ctx, "warmup", task) }); err != nil {
+		t.Fatalf("warm-up publish: %v", err)
+	}
+	const bound = 500 * time.Millisecond
+	durations := make([]time.Duration, 0, 5)
+	for i := 0; i < 5; i++ {
+		start := time.Now()
+		if err := p.Publish(ctx, "timed", task); err != nil {
+			t.Fatalf("publish %d: %v", i, err)
+		}
+		durations = append(durations, time.Since(start))
+	}
+	t.Logf("single-message publish durations (race detector on, local broker): %v", durations)
+	for i, d := range durations {
+		if d >= bound {
+			t.Errorf("publish %d took %v; a lone message is waiting on the batch timer (bound %v)", i, d, bound)
+		}
+	}
+}
