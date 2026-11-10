@@ -91,7 +91,7 @@ return fmt.Errorf("processing message from %s[%d] at offset %d: %w",
 
 The worker closes its reader and exits nonzero on that error. This prevents a later commit from passing the failed message. Real-Kafka integration tests verify the committed offset and that a new reader in the same group can fetch the unresolved message. Cancellation shuts down without committing interrupted work.
 
-Progress updates require `recorded=true`, including FAILED updates for exhausted replays. A successful gRPC exchange with `recorded=false` means the state update was rejected: the worker stops with an error and leaves the source message uncommitted. Transport errors also stop consumption. A started attempt remains counted; rejecting RUNNING prevents work, while rejecting COMPLETED can occur after work has already happened.
+Progress updates require `recorded=true`, including FAILED updates for exhausted replays. A successful gRPC exchange with `recorded=false` means the state update was rejected: the worker stops with an error and leaves the source message uncommitted. Transport errors also stop consumption. Each update must be acknowledged within ten seconds; a silent dispatch peer aborts the stream and stops the worker rather than leaving it blocked. The stream is not reconnected. A started attempt remains counted; rejecting RUNNING prevents work, while rejecting COMPLETED can occur after work has already happened.
 
 Worker progress accepts RUNNING, FAILED, and COMPLETED only, with percentages
 in 0–100; COMPLETED requires exactly 100. PENDING is assigned by submission,
