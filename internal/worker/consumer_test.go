@@ -24,6 +24,9 @@ type mockReader struct {
 	fetchErr error
 	closeErr error
 	onCommit func() // called after each CommitMessages, if non-nil
+	// commitErrs are returned by successive CommitMessages calls; later calls succeed.
+	commitErrs []error
+	committed  []string // keys passed to CommitMessages, including failed commits
 }
 
 func (m *mockReader) FetchMessage(ctx context.Context) (kafka.Message, error) {
@@ -42,9 +45,17 @@ func (m *mockReader) FetchMessage(ctx context.Context) (kafka.Message, error) {
 	return msg, nil
 }
 
-func (m *mockReader) CommitMessages(_ context.Context, _ ...kafka.Message) error {
+func (m *mockReader) CommitMessages(_ context.Context, msgs ...kafka.Message) error {
+	for _, msg := range msgs {
+		m.committed = append(m.committed, string(msg.Key))
+	}
 	if m.onCommit != nil {
 		m.onCommit()
+	}
+	if len(m.commitErrs) > 0 {
+		err := m.commitErrs[0]
+		m.commitErrs = m.commitErrs[1:]
+		return err
 	}
 	return nil
 }
@@ -576,5 +587,41 @@ func TestConsumer_Run_StopsOnRejectedProgress(t *testing.T) {
 				t.Errorf("continued after rejected update: calls=%d, want %d", sender.callCount, tc.rejectCall)
 			}
 		})
+	}
+}
+
+// A failed offset commit for already handled work is logged and consumption
+// continues: the next commit in the partition also covers the earlier offset,
+// and a replay after a crash is absorbed by the completed-task guard (covered
+// against real Kafka/Redis by TestConsumer_CompletedReplayDoesNotSpendAttempt).
+// Stopping here would turn a transient commit error into a worker exit without
+// protecting any unhandled message.
+func TestConsumer_Run_CommitFailureForHandledWorkContinues(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	reader := &mockReader{
+		messages: []kafka.Message{
+			{Key: []byte("first"), Value: marshalTask(t, &taskv1.Task{Type: "simulation"})},
+			{Key: []byte("second"), Value: marshalTask(t, &taskv1.Task{Type: "simulation"})},
+		},
+		commitErrs: []error{errors.New("coordinator not available")},
+	}
+	reader.onCommit = func() {
+		if len(reader.committed) == 2 {
+			cancel()
+		}
+	}
+	sender := &mockSender{}
+	c := newTestConsumer(sender)
+	c.reader = reader
+	if err := c.Run(ctx); err != nil {
+		t.Fatalf("a commit error for handled work stopped the worker: %v", err)
+	}
+	if got := strings.Join(reader.committed, ","); got != "first,second" {
+		t.Errorf("commits = %q; want the failed commit followed by the next message's commit", got)
+	}
+	if sender.callCount != 4 {
+		t.Errorf("progress updates = %d; want RUNNING and COMPLETED for both messages", sender.callCount)
 	}
 }
