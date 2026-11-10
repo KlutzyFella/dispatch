@@ -51,6 +51,12 @@ func run(logger *slog.Logger) error {
 	grpcAddr := envOrDefault(envGRPCAddr, defaultGRPCAddr)
 	redisAddr := envOrDefault(envRedisAddr, defaultRedisAddr)
 
+	// Consuming the DLQ would republish each exhausted message to the topic it
+	// was read from, growing the quarantine forever without a new attempt.
+	if kafkaTopic == defaultDLQTopic {
+		return fmt.Errorf("%s=%q must differ from the dead-letter topic", envKafkaTopic, kafkaTopic)
+	}
+
 	workerID := uuid.NewString()
 
 	logger.Info("starting worker",

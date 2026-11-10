@@ -25,7 +25,7 @@ Tasks travel through the Kafka topic `tasks.pending`. Both services use Redis ta
 
 Both services honor `KAFKA_TOPIC` for the pending-work topic; its default is
 `tasks.pending`. Set the same value on dispatch and worker. The DLQ remains
-`tasks.dead_letter`.
+`tasks.dead_letter`; the worker exits at startup if `KAFKA_TOPIC` names it.
 
 Both services require Redis PING and a Kafka metadata response during startup.
 The Kafka probe has a ten-second deadline. Dispatch opens its gRPC listener only

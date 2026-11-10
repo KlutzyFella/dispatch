@@ -105,3 +105,45 @@ func TestWorker_RejectsUnavailableKafka(t *testing.T) {
 		t.Errorf("startup did not identify the unavailable broker:\n%s", logs)
 	}
 }
+
+// A worker whose pending topic is the DLQ consumes its own quarantine. Each
+// exhausted message is republished to the topic it was read from, without a
+// new attempt, so one task grows the DLQ forever. Startup must refuse the
+// configuration before touching any dependency.
+func TestWorker_RejectsPendingTopicEqualToDLQ(t *testing.T) {
+	if testutil.MainProcessChild() {
+		main()
+		return
+	}
+	redis := testutil.RedisClient(t)
+	kafkaAddr, _ := testutil.KafkaTopic(t) // real broker reachable: only the topic is wrong
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	grpcServer := grpc.NewServer()
+	taskv1.RegisterDispatchServiceServer(grpcServer, &startupProgressServer{})
+	go grpcServer.Serve(listener)
+	t.Cleanup(grpcServer.Stop)
+	process := testutil.StartMainProcess(t, map[string]string{
+		"METRICS_PORT": testutil.UnusedTCPPort(t), "REDIS_ADDR": redis.Options().Addr,
+		"GRPC_SERVER_ADDR": listener.Addr().String(), "KAFKA_BROKER": kafkaAddr,
+		"KAFKA_TOPIC": "tasks.dead_letter", "KAFKA_GROUP_ID": "dlq-guard-" + strconv.FormatInt(time.Now().UnixNano(), 36),
+	})
+	exitErr, exited := process.Wait(5 * time.Second)
+	if !exited {
+		t.Error("worker started consuming its own dead-letter topic")
+		if err := process.Signal(syscall.SIGTERM); err != nil {
+			t.Fatal(err)
+		}
+		exitErr, exited = process.Wait(15 * time.Second)
+	}
+	var exit *exec.ExitError
+	if !exited || !errors.As(exitErr, &exit) || exit.ExitCode() != 1 {
+		t.Errorf("DLQ topic conflict must exit 1: exited=%v error=%v", exited, exitErr)
+	}
+	logs := process.Logs(t)
+	if !strings.Contains(logs, "must differ from the dead-letter topic") || strings.Contains(logs, "gRPC stream opened") {
+		t.Errorf("worker did not reject the topic conflict before starting dependencies:\n%s", logs)
+	}
+}
