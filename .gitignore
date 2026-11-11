@@ -1,0 +1,4 @@
+# Local stack state: binaries, logs, pid file (scripts/stack.sh)
+/.stack/
+# make build / build-worker output
+/bin/

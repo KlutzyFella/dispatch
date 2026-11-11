@@ -2,7 +2,7 @@ PROTO_DIR := proto
 GEN_DIR   := gen
 BIN_DIR   := bin
 
-.PHONY: install-tools generate build build-worker test lint run run-worker clean setup docker-build
+.PHONY: install-tools generate build build-worker test lint run run-worker up logs clean setup docker-build
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
@@ -59,6 +59,15 @@ run:
 ## run-worker: start the worker with default settings
 run-worker:
 	go run ./cmd/worker
+
+## up: start Redis, Kafka, dispatch and worker in dependency order and supervise
+##     them in the foreground (Ctrl-C stops everything); see scripts/stack.sh
+up:
+	./scripts/stack.sh
+
+## logs: follow the stack's logs (run in a second terminal while `make up` runs)
+logs:
+	tail -n 50 -F .stack/logs/stack.log .stack/logs/dispatch.log .stack/logs/worker.log
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 
