@@ -16,11 +16,35 @@ services:
       - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
       - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
       - KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0
+      # Keep the log on a named volume; the image default (/tmp) is lost when
+      # the container is recreated. A fixed cluster ID matches the stored data.
+      - KAFKA_LOG_DIRS=/var/lib/kafka/data
+      - CLUSTER_ID=kaAVWN7yRs2AUC_u0BEg0w
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # A protocol round trip, not just an open port.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 2s
+      timeout: 15s
+      retries: 60
+      start_period: 5s
   redis:
     image: redis:7.2
     container_name: dispatch-redis
+    # Task state, attempt budgets and publication intents live only in Redis.
+    # AOF with fsync every second survives restarts and recreation; a host
+    # crash or power loss can still lose up to about one second of writes.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     ports:
       - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
 
   prometheus:
     image: prom/prometheus:latest
@@ -41,3 +65,7 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=admin
     depends_on:
       - prometheus
+
+volumes:
+  kafka-data:
+  redis-data:
