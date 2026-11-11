@@ -117,35 +117,33 @@ Redis checks task existence and writes progress atomically. If deletion wins bef
 
 ### Prerequisites
 
-- Docker & Docker Compose
-- Go 1.23+
-- [`grpcurl`](https://github.com/fullstorydev/grpcurl)
+- Docker with the Compose v2 plugin
+- Go 1.23.0 or newer
+- [`grpcurl`](https://github.com/fullstorydev/grpcurl), only for submitting tasks by hand
 
-### 1. Start Infrastructure
-
-```bash
-docker compose up -d
-```
-
-This starts Kafka (KRaft, no ZooKeeper), Redis, Prometheus, and Grafana.
-
-### 2. Start the Dispatch Server
+### 1. Start the stack
 
 ```bash
-go run ./cmd/dispatch
+make up
 ```
 
-The gRPC server listens on `:50051`. Metrics are exposed on `:9090`.
+This runs `scripts/stack.sh` in the foreground. It checks tools and ports
+first, starts Redis and Kafka and waits for their healthchecks, creates
+`tasks.pending` and `tasks.dead_letter`, builds the binaries into
+`.stack/bin`, starts dispatch and waits for gRPC health, then starts a worker
+and waits until it has joined its consumer group. It prints `stack ready` when
+all of that holds. If any component exits or a container stops, the whole stack
+is stopped and the command exits 1, naming the cause.
 
-### 3. Start a Worker
+Measured from a clean state on one machine (WSL2, Docker 29.8.0, Go 1.26.1;
+images and Go modules already downloaded): 42-45 s with an empty Go build
+cache, 31-32 s with a warm one. Most of the time goes to the Go build, Kafka's
+startup, and the worker's first consumer-group join on a new broker.
+`scripts/measure-startup.sh --delete-volumes` reproduces the measurement; it
+deletes this project's Kafka and Redis data on every run.
 
-Open a second terminal:
-
-```bash
-go run ./cmd/worker
-```
-
-The worker connects to Kafka and opens a gRPC progress stream to the dispatch server. Metrics are exposed on `:9091`.
+Logs are in `.stack/logs`; follow them from a second terminal with
+`make logs`. Prometheus and Grafana are not started by `make up`.
 
 ### 4. Submit a Task
 
@@ -176,7 +174,15 @@ To verify idempotency, supply the same `idempotency_key` in a second call — th
 
 ### Shutdown
 
-On SIGINT or SIGTERM, dispatch gives existing gRPC calls five seconds to drain.
+Press Ctrl-C (or send SIGTERM) to the `make up` terminal. The worker stops
+first, then dispatch, then the Redis and Kafka containers; their data stays on
+the `kafka-data` and `redis-data` volumes. A second Ctrl-C does not interrupt
+the shutdown. `scripts/stack.sh` exits 0 after a requested stop and 1 after a
+failure; through `make`, those appear as make's own `Interrupt` (130) and
+`Error 1` (exit 2). `scripts/test-stack.sh` checks these paths, and component death,
+against real containers.
+
+Within dispatch, on SIGINT or SIGTERM, dispatch gives existing gRPC calls five seconds to drain.
 It then logs `forcing gRPC shutdown` and closes remaining connections, including
 workers' open progress streams. Closed streams drain without waiting for the
 deadline. The integration regression executes the actual `main` in a compiled
