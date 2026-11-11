@@ -13,7 +13,7 @@ set -m
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 WORK=$(mktemp -d)
 export STACK_DIR=$WORK/stack
-PORTS=(50051 9090 9091 9092 6379)
+PORTS=(50051 9090 9091 9101 9111 9092 6379)
 FAILED=0 PASSED=0 STACK_PID=""
 
 trap 'stop_stack; rm -rf "$WORK"' EXIT
@@ -107,8 +107,8 @@ scenario_ready_and_interrupt() {
 	kill -INT -- "-$STACK_PID"
 	wait_exit 60
 	[[ $EXIT_CODE == 0 ]] && pass "Ctrl-C exited 0" || fail "Ctrl-C exit=$EXIT_CODE"
-	grep -q 'stopping worker' "$WORK/out" && grep -q 'stopping dispatch' "$WORK/out" &&
-		[[ $(grep -n 'stopping worker' "$WORK/out" | cut -d: -f1) -lt $(grep -n 'stopping dispatch' "$WORK/out" | cut -d: -f1) ]] &&
+	grep -q 'stopping worker-1' "$WORK/out" && grep -q 'stopping dispatch' "$WORK/out" &&
+		[[ $(grep -n 'stopping worker-1' "$WORK/out" | cut -d: -f1) -lt $(grep -n 'stopping dispatch' "$WORK/out" | cut -d: -f1) ]] &&
 		pass "worker stopped before dispatch" || fail "shutdown order wrong or missing"
 	assert_clean "after Ctrl-C"
 }
@@ -176,7 +176,7 @@ scenario_double_interrupt() {
 	start_stack
 	wait_for_output 'stack ready' 180 || { fail "stack never became ready"; stop_stack; return; }
 	kill -INT -- "-$STACK_PID"
-	wait_for_output 'stopping worker' 30 || { fail "shutdown never started"; stop_stack; return; }
+	wait_for_output 'stopping worker-1' 30 || { fail "shutdown never started"; stop_stack; return; }
 	kill -INT -- "-$STACK_PID"
 	wait_exit 60
 	[[ $EXIT_CODE == 0 ]] && pass "double Ctrl-C exited 0" || fail "double Ctrl-C exit=$EXIT_CODE"
@@ -194,6 +194,32 @@ scenario_sigterm() {
 	wait_exit 60
 	[[ $EXIT_CODE == 0 ]] && pass "SIGTERM exited 0" || fail "SIGTERM exit=$EXIT_CODE"
 	assert_clean "after SIGTERM"
+}
+
+# Several workers each join the group with their own metrics port; one dying
+# stops the stack and is named. WORKERS=0 runs dispatch alone.
+scenario_workers() {
+	say "WORKERS=3 on 3 partitions"
+	start_stack WORKERS=3 KAFKA_PARTITIONS=3
+	wait_for_output 'stack ready' 180 || { fail "stack never became ready"; stop_stack; return; }
+	local members
+	members=$(docker compose --project-directory "$ROOT" exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+		--bootstrap-server localhost:9092 --describe --group dispatch-workers --members 2>/dev/null | awk '$1 == "dispatch-workers"' | wc -l)
+	[[ $members == 3 ]] && pass "3 workers in the consumer group" || fail "group members=$members, want 3"
+	curl -fsS localhost:9111/metrics >/dev/null && pass "worker-3 serves metrics on :9111" || fail "worker-3 metrics not on :9111"
+	kill -KILL "$(pid_from_log worker-2)"
+	wait_exit 60
+	[[ $EXIT_CODE == 1 ]] && grep -q 'worker-2 died' "$WORK/out" && pass "worker-2 death stopped the stack" || fail "worker-2 death: exit=$EXIT_CODE"
+	assert_clean "after worker-2 died"
+
+	say "WORKERS=0 runs dispatch only"
+	start_stack WORKERS=0
+	wait_for_output 'stack ready' 180 || { fail "stack never became ready"; stop_stack; return; }
+	grep -q 'starting worker' "$WORK/out" && fail "a worker started with WORKERS=0" || pass "no worker started"
+	kill -INT -- "-$STACK_PID"
+	wait_exit 60
+	[[ $EXIT_CODE == 0 ]] && pass "WORKERS=0 Ctrl-C exited 0" || fail "WORKERS=0 Ctrl-C exit=$EXIT_CODE"
+	assert_clean "after WORKERS=0 stop"
 }
 
 # A preflight failure must not stop Kafka/Redis containers it never started.
@@ -231,7 +257,8 @@ main() {
 		scenario_ready_and_interrupt
 		scenario_double_interrupt
 		scenario_sigterm
-		scenario_component_dies worker
+		scenario_workers
+		scenario_component_dies worker-1
 		scenario_component_dies dispatch
 		scenario_kafka_dies
 	fi

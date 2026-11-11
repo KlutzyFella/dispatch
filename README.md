@@ -142,6 +142,11 @@ startup, and the worker's first consumer-group join on a new broker.
 `scripts/measure-startup.sh --delete-volumes` reproduces the measurement; it
 deletes this project's Kafka and Redis data on every run.
 
+`WORKERS=N` starts N workers (default 1; 0 runs dispatch alone), and
+`KAFKA_PARTITIONS` sets the topic partition count used when the topics are
+first created. Workers beyond the partition count receive no work. Worker *i*
+serves metrics on `WORKER_METRICS_PORT + 10*(i-1)`, i.e. 9091, 9101, ...
+
 Logs are in `.stack/logs`; follow them from a second terminal with
 `make logs`. Prometheus and Grafana are not started by `make up`.
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the local Dispatch stack in the foreground:
-#   Redis + Kafka (Compose, healthchecked) -> topics -> dispatch -> worker.
-# Ctrl-C (SIGINT) or SIGTERM stops the worker, then dispatch, then the
+#   Redis + Kafka (Compose, healthchecked) -> topics -> dispatch -> workers.
+# Ctrl-C (SIGINT) or SIGTERM stops the workers, then dispatch, then the
 # containers (their data stays on named volumes). If any component dies, the
 # rest is stopped and the script exits 1. Logs go to $STACK_DIR/logs.
 set -euo pipefail
@@ -19,6 +19,7 @@ WORKER_METRICS_PORT=${WORKER_METRICS_PORT:-9091}
 KAFKA_TOPIC=${KAFKA_TOPIC:-tasks.pending}
 KAFKA_GROUP_ID=${KAFKA_GROUP_ID:-dispatch-workers}
 KAFKA_PARTITIONS=${KAFKA_PARTITIONS:-1}
+WORKERS=${WORKERS:-1} # worker i (1-based) serves metrics on WORKER_METRICS_PORT+10*(i-1)
 READY_TIMEOUT=${READY_TIMEOUT:-120}
 STOP_TIMEOUT=${STOP_TIMEOUT:-15}
 KEEP_INFRA=${KEEP_INFRA:-0}
@@ -28,7 +29,8 @@ readonly KAFKA_PORT=9092 REDIS_PORT=6379 # published in docker-compose.yml
 readonly INFRA_SERVICES=(kafka redis)
 readonly CONTAINERS=(dispatch-kafka dispatch-redis)
 
-DISPATCH_PID="" WORKER_PID="" STOPPING=0 INFRA_STARTED=0
+declare -A PIDS=() # component name -> pid
+STOPPING=0 INFRA_STARTED=0
 PROBE="" # scratch file for probe output
 
 log() { printf '%s [stack] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG_DIR/stack.log" >&2; }
@@ -70,22 +72,27 @@ preflight() {
 
 	[[ $KAFKA_TOPIC != "$DLQ_TOPIC" ]] || die "KAFKA_TOPIC must differ from the dead-letter topic $DLQ_TOPIC"
 	[[ $KAFKA_PARTITIONS =~ ^[1-9][0-9]*$ ]] || die "KAFKA_PARTITIONS must be a positive integer, got '$KAFKA_PARTITIONS'"
+	[[ $WORKERS =~ ^[0-9]+$ ]] || die "WORKERS must be a non-negative integer, got '$WORKERS'"
+	((WORKERS <= KAFKA_PARTITIONS)) ||
+		log "WARNING: WORKERS=$WORKERS exceeds KAFKA_PARTITIONS=$KAFKA_PARTITIONS; $((WORKERS - KAFKA_PARTITIONS)) worker(s) will receive no partition"
 	local name value
 	for name in PORT DISPATCH_METRICS_PORT WORKER_METRICS_PORT; do
 		value=${!name}
-		[[ $value =~ ^[0-9]+$ ]] && ((value > 0 && value < 65536)) || die "$name must be a TCP port, got '$value'"
+		[[ $value =~ ^[0-9]+$ ]] && ((value > 0 && value + 10 * WORKERS < 65536)) || die "$name must be a TCP port, got '$value'"
 	done
-	[[ $DISPATCH_METRICS_PORT != "$WORKER_METRICS_PORT" ]] || die "DISPATCH_METRICS_PORT and WORKER_METRICS_PORT must differ"
+	local ports=("$PORT" "$DISPATCH_METRICS_PORT") i
+	for ((i = 1; i <= WORKERS; i++)); do ports+=("$(worker_metrics_port "$i")"); done
+	[[ $(printf '%s\n' "${ports[@]}" $KAFKA_PORT $REDIS_PORT | sort | uniq -d) == "" ]] ||
+		die "application ports overlap each other or Kafka/Redis ($KAFKA_PORT/$REDIS_PORT): ${ports[*]}"
 
 	# Application ports must be free. Kafka/Redis ports may be held only by this
 	# project's own running containers, which are reused.
 	local port
-	for port in "$PORT" "$DISPATCH_METRICS_PORT" "$WORKER_METRICS_PORT"; do
+	for port in "${ports[@]}"; do
 		if port_in_use "$port"; then
 			die "port $port is already in use$(port_owner "$port"); stop that process or override the port variable"
 		fi
 	done
-	local i
 	for i in 0 1; do
 		port=$([[ $i == 0 ]] && echo $KAFKA_PORT || echo $REDIS_PORT)
 		if port_in_use "$port" && ! container_running "${CONTAINERS[$i]}"; then
@@ -93,6 +100,8 @@ preflight() {
 		fi
 	done
 }
+
+worker_metrics_port() { echo $((WORKER_METRICS_PORT + 10 * ($1 - 1))); }
 
 port_owner() {
 	local owner
@@ -149,27 +158,32 @@ wait_until() {
 
 dispatch_healthy() { "$BIN_DIR/healthcheck" -addr "localhost:$PORT"; }
 
-worker_joined() {
+# workers_joined N: the consumer group has at least N members.
+workers_joined() {
 	kafka_cli kafka-consumer-groups.sh --describe --group "$KAFKA_GROUP_ID" --members >"$PROBE" 2>/dev/null &&
-		awk -v g="$KAFKA_GROUP_ID" '$1 == g { found = 1 } END { exit !found }' "$PROBE"
+		awk -v g="$KAFKA_GROUP_ID" -v n="$1" '$1 == g { count++ } END { exit !(count >= n) }' "$PROBE"
 }
 
 start_dispatch() {
 	log "starting dispatch (gRPC :$PORT, metrics :$DISPATCH_METRICS_PORT)"
 	PORT=$PORT METRICS_PORT=$DISPATCH_METRICS_PORT KAFKA_TOPIC=$KAFKA_TOPIC \
 		"$BIN_DIR/dispatch" >>"$LOG_DIR/dispatch.log" 2>&1 &
-	DISPATCH_PID=$!
-	wait_until dispatch "$DISPATCH_PID" dispatch_healthy
-	log "dispatch ready (pid $DISPATCH_PID, gRPC health SERVING)"
+	PIDS[dispatch]=$!
+	wait_until dispatch "${PIDS[dispatch]}" dispatch_healthy
+	log "dispatch ready (pid ${PIDS[dispatch]}, gRPC health SERVING)"
 }
 
-start_worker() {
-	log "starting worker (metrics :$WORKER_METRICS_PORT, group $KAFKA_GROUP_ID)"
-	METRICS_PORT=$WORKER_METRICS_PORT KAFKA_TOPIC=$KAFKA_TOPIC KAFKA_GROUP_ID=$KAFKA_GROUP_ID \
-		GRPC_SERVER_ADDR="localhost:$PORT" "$BIN_DIR/worker" >>"$LOG_DIR/worker.log" 2>&1 &
-	WORKER_PID=$!
-	wait_until worker "$WORKER_PID" worker_joined
-	log "worker ready (pid $WORKER_PID, joined consumer group $KAFKA_GROUP_ID)"
+start_workers() {
+	local i name
+	for ((i = 1; i <= WORKERS; i++)); do
+		name=worker-$i
+		log "starting $name (metrics :$(worker_metrics_port "$i"), group $KAFKA_GROUP_ID)"
+		METRICS_PORT=$(worker_metrics_port "$i") KAFKA_TOPIC=$KAFKA_TOPIC KAFKA_GROUP_ID=$KAFKA_GROUP_ID \
+			GRPC_SERVER_ADDR="localhost:$PORT" "$BIN_DIR/worker" >>"$LOG_DIR/$name.log" 2>&1 &
+		PIDS[$name]=$!
+		wait_until "$name" "${PIDS[$name]}" workers_joined "$i"
+		log "$name ready (pid ${PIDS[$name]}, joined consumer group $KAFKA_GROUP_ID)"
+	done
 }
 
 # ── Supervision and shutdown ───────────────────────────────────────────────────
@@ -184,11 +198,10 @@ report_exit() {
 supervise() {
 	local name i
 	while true; do
-		for name in dispatch worker; do
-			local pid_var=${name^^}_PID
-			if ! kill -0 "${!pid_var}" 2>/dev/null; then
-				report_exit "$name" "${!pid_var}"
-				printf -v "$pid_var" ''
+		for name in "${!PIDS[@]}"; do
+			if ! kill -0 "${PIDS[$name]}" 2>/dev/null; then
+				report_exit "$name" "${PIDS[$name]}"
+				unset "PIDS[$name]"
 				die "$name died; stopping the stack"
 			fi
 		done
@@ -203,21 +216,31 @@ supervise() {
 	done
 }
 
-stop_process() {
-	local name=$1 pid=$2 deadline
-	[[ -n $pid ]] && kill -0 "$pid" 2>/dev/null || return 0
-	log "stopping $name (pid $pid)"
-	kill -TERM "$pid" 2>/dev/null || true
-	deadline=$((SECONDS + STOP_TIMEOUT))
-	while kill -0 "$pid" 2>/dev/null; do
-		if ((SECONDS >= deadline)); then
-			log "WARNING: $name did not exit within ${STOP_TIMEOUT}s; sending SIGKILL"
-			kill -KILL "$pid" 2>/dev/null || true
-			break
-		fi
-		pause 0.2
+# stop_processes NAME...: SIGTERM every named live component at once, wait up
+# to STOP_TIMEOUT for all of them, then SIGKILL any that remain.
+stop_processes() {
+	local name live=() deadline
+	for name in "$@"; do
+		[[ -n ${PIDS[$name]:-} ]] && kill -0 "${PIDS[$name]}" 2>/dev/null && live+=("$name")
 	done
-	wait "$pid" 2>/dev/null || true
+	((${#live[@]})) || return 0
+	for name in "${live[@]}"; do
+		log "stopping $name (pid ${PIDS[$name]})"
+		kill -TERM "${PIDS[$name]}" 2>/dev/null || true
+	done
+	deadline=$((SECONDS + STOP_TIMEOUT))
+	for name in "${live[@]}"; do
+		while kill -0 "${PIDS[$name]}" 2>/dev/null; do
+			if ((SECONDS >= deadline)); then
+				log "WARNING: $name did not exit within ${STOP_TIMEOUT}s; sending SIGKILL"
+				kill -KILL "${PIDS[$name]}" 2>/dev/null || true
+				break
+			fi
+			pause 0.2
+		done
+		wait "${PIDS[$name]}" 2>/dev/null || true
+	done
+	return 0
 }
 
 shutdown() {
@@ -226,8 +249,12 @@ shutdown() {
 	STOPPING=1
 	# A second Ctrl-C must not abandon a half-finished shutdown.
 	trap 'log "already stopping; waiting for components to exit"' INT TERM
-	stop_process worker "$WORKER_PID"
-	stop_process dispatch "$DISPATCH_PID"
+	local name workers=()
+	for name in "${!PIDS[@]}"; do
+		if [[ $name == worker-* ]]; then workers+=("$name"); fi
+	done
+	stop_processes "${workers[@]}"
+	stop_processes dispatch
 	if ((!INFRA_STARTED)); then
 		: # failed before touching Redis/Kafka; leave any running containers alone
 	elif [[ $KEEP_INFRA == 1 ]]; then
@@ -257,7 +284,7 @@ main() {
 	start_infra
 	create_topics
 	start_dispatch
-	start_worker
+	start_workers
 	log "stack ready in ${SECONDS}s — gRPC localhost:$PORT; press Ctrl-C to stop"
 	supervise
 }

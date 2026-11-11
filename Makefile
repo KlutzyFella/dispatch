@@ -67,7 +67,7 @@ up:
 
 ## logs: follow the stack's logs (run in a second terminal while `make up` runs)
 logs:
-	tail -n 50 -F .stack/logs/stack.log .stack/logs/dispatch.log .stack/logs/worker.log
+	tail -n 50 -F .stack/logs/stack.log .stack/logs/dispatch.log .stack/logs/worker-*.log
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 
