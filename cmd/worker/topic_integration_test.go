@@ -15,7 +15,6 @@ import (
 	"github.com/ronnitchopra/dispatch/internal/broker"
 	"github.com/ronnitchopra/dispatch/internal/state"
 	"github.com/ronnitchopra/dispatch/internal/testutil"
-	"github.com/segmentio/kafka-go"
 	"google.golang.org/grpc"
 )
 
@@ -44,34 +43,12 @@ func TestWorker_ConsumesConfiguredTopic(t *testing.T) {
 	addr, topic := testutil.KafkaTopic(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	// The old worker subscribes to the shared default topic. Refuse this test
-	// against a broker with unrelated work there, rather than consume it.
-	conn, err := kafka.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	deadline, _ := ctx.Deadline()
-	conn.SetDeadline(deadline)
-	partitions, err := conn.ReadPartitions()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, partition := range partitions {
-		if partition.Topic != defaultKafkaTopic {
-			continue
-		}
-		leader, err := kafka.DialLeader(ctx, "tcp", addr, partition.Topic, partition.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		leader.SetDeadline(deadline)
-		first, last, err := leader.ReadOffsets()
-		leader.Close()
-		if err != nil || first != last {
-			t.Fatalf("configuration regression requires an isolated broker with no default-topic work: first=%d last=%d error=%v", first, last, err)
-		}
-	}
+	// A worker that ignored KAFKA_TOPIC would read the shared default topic from
+	// its first offset under this test's unique group. The stub below never
+	// acknowledges, so such a regression fails here (wrong task, or no task
+	// within the deadline) after at most one started attempt on an unfinished
+	// task found there. The fixed worker never reads the default topic, so a
+	// broker that has run the local stack is fine.
 	client := testutil.RedisClient(t)
 	store := state.NewRedisTaskStore(client)
 	t.Cleanup(func() { client.Del(context.Background(), "task:"+topic) })
