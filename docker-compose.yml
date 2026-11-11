@@ -23,12 +23,15 @@ services:
     volumes:
       - kafka-data:/var/lib/kafka/data
     healthcheck:
-      # A protocol round trip, not just an open port.
+      # A protocol round trip, not just an open port. Each check starts a JVM
+      # (about 1.6 s of CPU), so probe every second only while starting, then
+      # every 30 s: at a 2 s interval the check alone used ~0.85 of a core.
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
-      interval: 2s
+      start_period: 120s
+      start_interval: 1s
+      interval: 30s
       timeout: 15s
-      retries: 60
-      start_period: 5s
+      retries: 3
   redis:
     image: redis:7.2
     container_name: dispatch-redis
@@ -42,9 +45,11 @@ services:
       - redis-data:/data
     healthcheck:
       test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
-      interval: 1s
+      start_period: 30s
+      start_interval: 1s
+      interval: 10s
       timeout: 3s
-      retries: 30
+      retries: 3
 
   prometheus:
     image: prom/prometheus:latest
