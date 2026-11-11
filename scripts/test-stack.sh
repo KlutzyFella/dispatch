@@ -81,7 +81,10 @@ pid_from_log() { sed -n "s/.*$1 ready (pid \([0-9]*\).*/\1/p" "$WORK/out" | tail
 
 scenario_ready_and_interrupt() {
 	say "start, complete one task, then Ctrl-C"
-	start_stack
+	# Own topic and group, so a backlog left on the default topic by earlier use
+	# of the stack cannot delay this task.
+	local topic=stack-test-$RANDOM$RANDOM
+	start_stack KAFKA_TOPIC="$topic" KAFKA_GROUP_ID="$topic"
 	if ! wait_for_output 'stack ready' 180; then
 		fail "stack never became ready"
 		stop_stack
@@ -111,6 +114,10 @@ scenario_ready_and_interrupt() {
 		[[ $(grep -n 'stopping worker-1' "$WORK/out" | cut -d: -f1) -lt $(grep -n 'stopping dispatch' "$WORK/out" | cut -d: -f1) ]] &&
 		pass "worker stopped before dispatch" || fail "shutdown order wrong or missing"
 	assert_clean "after Ctrl-C"
+	docker compose --project-directory "$ROOT" up -d --wait kafka >/dev/null 2>&1 &&
+		docker compose --project-directory "$ROOT" exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+			--bootstrap-server localhost:9092 --delete --topic "$topic" >/dev/null 2>&1 || true
+	docker compose --project-directory "$ROOT" stop kafka >/dev/null 2>&1 || true
 }
 
 scenario_component_dies() {
