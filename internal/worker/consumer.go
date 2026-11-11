@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -14,6 +15,12 @@ import (
 	"github.com/ronnitchopra/dispatch/internal/metrics"
 	"github.com/ronnitchopra/dispatch/internal/state"
 )
+
+// errCompletedElsewhere reports a refused update for a task that another
+// delivery of the same message has already completed. Under at-least-once
+// delivery a rebalance can hand an in-flight message to a second worker; the
+// server's terminal guard then refuses the slower copy's late updates.
+var errCompletedElsewhere = errors.New("task already completed by another delivery")
 
 // ProgressSender is the interface the Consumer uses to report task progress.
 // It is satisfied by *ProgressReporter and can be mocked in tests.
@@ -123,7 +130,18 @@ func (c *Consumer) Run(ctx context.Context) error {
 }
 
 // processMessage is the per-message execution logic, extracted for testability.
+// A duplicate delivery whose task finished elsewhere is handled, not an error.
 func (c *Consumer) processMessage(ctx context.Context, key, value []byte) error {
+	err := c.processDelivery(ctx, key, value)
+	if errors.Is(err, errCompletedElsewhere) {
+		c.logger.Info("duplicate delivery already completed elsewhere",
+			slog.String("task_id", string(key)), slog.String("worker_id", c.workerID))
+		return nil
+	}
+	return err
+}
+
+func (c *Consumer) processDelivery(ctx context.Context, key, value []byte) error {
 	taskID := string(key)
 	var task taskv1.Task
 	if err := proto.Unmarshal(value, &task); err != nil {
@@ -161,7 +179,7 @@ func (c *Consumer) processMessage(ctx context.Context, key, value []byte) error 
 				return nil
 			}
 			if record.Status != int32(taskv1.TaskStatus_TASK_STATUS_FAILED) {
-				if err := c.reportProgress(taskID, taskv1.TaskStatus_TASK_STATUS_FAILED, 0); err != nil {
+				if err := c.reportProgress(ctx, taskID, taskv1.TaskStatus_TASK_STATUS_FAILED, 0); err != nil {
 					return err
 				}
 			}
@@ -185,7 +203,7 @@ func (c *Consumer) processAttempt(ctx context.Context, taskID string) (bool, err
 	start := time.Now()
 
 	// Report RUNNING.
-	if err := c.reportProgress(taskID, taskv1.TaskStatus_TASK_STATUS_RUNNING, 0); err != nil {
+	if err := c.reportProgress(ctx, taskID, taskv1.TaskStatus_TASK_STATUS_RUNNING, 0); err != nil {
 		return false, err
 	}
 
@@ -206,7 +224,7 @@ func (c *Consumer) processAttempt(ctx context.Context, taskID string) (bool, err
 	}
 
 	// Report COMPLETED.
-	if err := c.reportProgress(taskID, taskv1.TaskStatus_TASK_STATUS_COMPLETED, 100); err != nil {
+	if err := c.reportProgress(ctx, taskID, taskv1.TaskStatus_TASK_STATUS_COMPLETED, 100); err != nil {
 		return false, err
 	}
 
@@ -232,12 +250,15 @@ func (c *Consumer) handleFailure(ctx context.Context, taskID string, start time.
 		slog.String("worker_id", c.workerID),
 	)
 
-	return c.reportProgress(taskID, taskv1.TaskStatus_TASK_STATUS_FAILED, 0)
+	return c.reportProgress(ctx, taskID, taskv1.TaskStatus_TASK_STATUS_FAILED, 0)
 }
 
 // reportProgress requires an explicit recording acknowledgment before processing
 // can advance. A transport success alone does not mean the state was persisted.
-func (c *Consumer) reportProgress(taskID string, status taskv1.TaskStatus, progress int32) error {
+// A refusal is re-checked against the stored task: if it is already COMPLETED
+// the refusal is the terminal guard, reported as errCompletedElsewhere; any
+// other refusal, or a failed re-check, stops processing.
+func (c *Consumer) reportProgress(ctx context.Context, taskID string, status taskv1.TaskStatus, progress int32) error {
 	ack, err := c.reporter.SendUpdate(&taskv1.ProgressUpdate{
 		TaskId:   taskID,
 		WorkerId: c.workerID,
@@ -248,6 +269,10 @@ func (c *Consumer) reportProgress(taskID string, status taskv1.TaskStatus, progr
 		return fmt.Errorf("reporting %s for task %q: %w", status, taskID, err)
 	}
 	if !ack.GetRecorded() {
+		if record, err := c.attempts.GetTask(ctx, taskID); err == nil &&
+			record.Status == int32(taskv1.TaskStatus_TASK_STATUS_COMPLETED) {
+			return fmt.Errorf("%s update for task %q: %w", status, taskID, errCompletedElsewhere)
+		}
 		return fmt.Errorf("%s update for task %q was not recorded", status, taskID)
 	}
 	return nil
