@@ -291,6 +291,20 @@ make docker-build   # Build both Docker images
 make clean          # Remove generated artifacts and binaries
 ```
 
+## Benchmarks
+
+Measured on one laptop with the load generator on the same machine
+(details, method and caveats in [docs/BENCHMARKS.md](docs/BENCHMARKS.md)):
+
+- `SubmitTask` held p95 ≤ 50 ms at 6,000 req/s in 7 of 7 runs (p95 14-16 ms)
+  and at 7,000 req/s in 3 of 3; above that the boundary is noisy. Across
+  20.2 million requests every response was `ACCEPTED`, and every accepted
+  task was verified in Kafka exactly once.
+- A soak of 2,400 tasks through 8 workers lost none: 2,380 completed and
+  20 ended in the DLQ after exhausting their retries.
+
+Worker throughput is not benchmarked: a task is a two-second simulated timer.
+
 ## Tests
 
 Start Kafka and Redis, verify that both answer protocol requests, then include
