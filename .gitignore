@@ -2,3 +2,5 @@
 /.stack/
 # make build / build-worker output
 /bin/
+# Python bytecode from scripts/bench
+__pycache__/
