@@ -111,27 +111,40 @@ def host_cpu() -> tuple[int, int]:
 
 
 class Stack:
-    """Runs scripts/stack.sh from deleted volumes; extra env selects workers etc."""
+    """Runs scripts/stack.sh; extra env selects workers etc.
 
-    def __init__(self, log_path: str, env: dict[str, str] | None = None) -> None:
+    fresh=True deletes the project's Kafka/Redis volumes and .stack first;
+    fresh=False restarts on the existing data (used to replay a finished soak).
+    """
+
+    def __init__(self, log_path: str, env: dict[str, str] | None = None, fresh: bool = True) -> None:
         self.log_path = log_path
         self.env = env or {"WORKERS": "0"}
+        self.fresh = fresh
 
     def __enter__(self) -> "Stack":
-        compose("down", "-v")
-        sh("rm", "-rf", str(ROOT / ".stack"))
-        self.log = open(self.log_path, "w")
+        if self.fresh:
+            compose("down", "-v")
+            sh("rm", "-rf", str(ROOT / ".stack"))
+        self.log = open(self.log_path, "a")
+        self.log_offset = Path(self.log_path).stat().st_size
         env = dict(os.environ, **self.env)
         self.proc = subprocess.Popen([str(ROOT / "scripts/stack.sh")], cwd=ROOT, env=env,
                                      stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
-        deadline = time.time() + 240
-        while "stack ready" not in Path(self.log_path).read_text():
+        deadline = time.time() + 600  # 32 workers join one by one, each a rebalance
+        while "stack ready" not in self.output():
             if self.proc.poll() is not None or time.time() > deadline:
                 raise RuntimeError(f"stack did not become ready; see {self.log_path}")
             time.sleep(0.5)
-        match = re.search(r"dispatch ready \(pid (\d+)", Path(self.log_path).read_text())
+        match = re.search(r"dispatch ready \(pid (\d+)", self.output())
         self.dispatch_pid = int(match.group(1))
         return self
+
+    def output(self) -> str:
+        """This run's part of the (appended) stack log."""
+        with open(self.log_path) as f:
+            f.seek(self.log_offset)
+            return f.read()
 
     def __exit__(self, *exc: object) -> None:
         os.killpg(self.proc.pid, signal.SIGINT)
