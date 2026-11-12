@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # go.mod's declared minimum. GOTOOLCHAIN=local makes a mismatch fail instead
+  # of silently downloading another toolchain.
+  GO_VERSION: "1.23.0"
+  GOTOOLCHAIN: local
+
+jobs:
+  checks:
+    name: Format, vet, module drift, unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Lint (gofmt diff, go vet for both build tags, go mod verify, go mod tidy -diff)
+        run: make lint
+      - name: Unit tests (race detector)
+        run: make test
+      - name: Python helper scripts compile
+        run: python3 -m py_compile scripts/ci/*.py scripts/bench/*.py
+
+  integration:
+    name: Integration tests (real Kafka and Redis)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      # The same docker-compose.yml as local development: same images, Kafka
+      # settings, Redis AOF command and healthchecks. GitHub `services:` cannot
+      # set a container command, so Redis would differ from local there.
+      - name: Start Kafka and Redis and wait for their healthchecks
+        run: docker compose up -d --wait --wait-timeout 180 kafka redis
+      - name: Full test suite (fails on any skipped test)
+        run: make test-integration
+      - name: Dump Kafka and Redis logs
+        if: failure()
+        run: docker compose logs --no-color --timestamps kafka redis | tee infra.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure()
+        with:
+          name: integration-logs
+          path: |
+            test-results.json
+            infra.log
+          if-no-files-found: ignore
+
+  stack:
+    name: One-command stack scenarios (make up)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      # A test tool, not project code: let Go fetch whatever toolchain grpcurl's
+      # own go.mod requires instead of failing under GOTOOLCHAIN=local.
+      - name: Install grpcurl (submits a task in one scenario)
+        run: GOTOOLCHAIN=auto go install github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.3
+      - name: Stack scenarios
+        run: STACK_TEST_ARTIFACTS="$RUNNER_TEMP/stack-logs" make test-stack
+      - name: Dump Kafka and Redis logs
+        if: failure()
+        run: |
+          mkdir -p "$RUNNER_TEMP/stack-logs"
+          docker compose logs --no-color --timestamps kafka redis | tee "$RUNNER_TEMP/stack-logs/infra.log"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure()
+        with:
+          name: stack-logs
+          path: ${{ runner.temp }}/stack-logs
+          if-no-files-found: ignore
