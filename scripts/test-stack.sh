@@ -68,11 +68,29 @@ wait_for_output() {
 wait_exit() {
 	local deadline=$((SECONDS + $1))
 	while kill -0 "$STACK_PID" 2>/dev/null; do
-		((SECONDS < deadline)) || { EXIT_CODE=timeout; return; }
+		if ((SECONDS >= deadline)); then
+			EXIT_CODE=timeout
+			force_stop
+			return
+		fi
 		sleep 0.2
 	done
 	EXIT_CODE=0
 	wait "$STACK_PID" || EXIT_CODE=$?
+	STACK_PID=""
+}
+
+# force_stop: a stack that outlived its scenario must not leak into the next
+# one ("a stack is already running"). Ask it to stop, then kill it and any
+# binaries it started.
+force_stop() {
+	local pid=$STACK_PID deadline=$((SECONDS + 60))
+	kill -INT -- "-$pid" 2>/dev/null || true
+	while kill -0 "$pid" 2>/dev/null && ((SECONDS < deadline)); do sleep 0.2; done
+	kill -KILL -- "-$pid" 2>/dev/null || true
+	pkill -KILL -f "$STACK_DIR/bin/" 2>/dev/null || true
+	wait "$pid" 2>/dev/null || true
+	rm -f "$STACK_DIR/stack.pid"
 	STACK_PID=""
 }
 
@@ -184,17 +202,17 @@ scenario_preflight() {
 		pass "DLQ topic rejected" || fail "DLQ topic: exit=$EXIT_CODE"
 
 	say "preflight reports a missing tool"
-	local fakebin=$WORK/fakebin
+	# PATH holds only what stack.sh runs before preflight fails, so go is
+	# absent even on hosts with a go in /usr/bin (GitHub's runners have one).
+	local fakebin=$WORK/fakebin tool
 	mkdir -p "$fakebin"
-	ln -sf "$(command -v docker)" "$fakebin/docker"
-	start_stack PATH="$fakebin:/usr/bin:/bin"
+	for tool in bash docker dirname mkdir date tee rm; do
+		ln -sf "$(command -v "$tool")" "$fakebin/$tool"
+	done
+	start_stack PATH="$fakebin"
 	wait_exit 30
-	if command -v go | grep -qE '^/(usr/)?bin/go$'; then
-		echo "SKIP-NOTE: go is in /usr/bin; missing-tool check not meaningful here"
-	else
-		[[ $EXIT_CODE == 1 ]] && grep -q 'missing required tools: go' "$WORK/out" &&
-			pass "missing go reported" || fail "missing go: exit=$EXIT_CODE"
-	fi
+	[[ $EXIT_CODE == 1 ]] && grep -q 'missing required tools: go' "$WORK/out" &&
+		pass "missing go reported" || fail "missing go: exit=$EXIT_CODE"
 }
 
 # A second Ctrl-C while shutdown is in progress must not abandon it: the
