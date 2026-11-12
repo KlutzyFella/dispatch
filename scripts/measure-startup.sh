@@ -30,7 +30,7 @@ for run in $(seq 1 "$runs"); do
 	done
 	ready=$(date +%s.%N)
 	reported=$(grep -o 'stack ready in [0-9]*s' "$out" || echo "NOT READY")
-	steps=$(awk '{print $1, substr($0, index($0,$3))}' "$out" | grep -E 'building|starting Redis|topics ready|dispatch ready|worker ready' | awk '{print $1}' | paste -sd' ')
+	steps=$(awk '{print $1, substr($0, index($0,$3))}' "$out" | grep -E 'building|starting Redis|topics ready|dispatch ready|consumer group .* stable' | awk '{print $1}' | paste -sd' ')
 	kill -INT -- "-$pid"
 	wait "$pid" || true
 	printf 'run=%d cold_build=%d wall_to_ready=%.1fs %s step_times=[%s]\n' "$run" "$cold" "$(echo "$ready - $start" | bc)" "$reported" "$steps"

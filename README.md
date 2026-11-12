@@ -1,361 +1,308 @@
 # Dispatch
 
-A task-dispatch simulation built with Go, gRPC, Kafka, and Redis.
+A task-dispatch system in Go. Clients submit tasks over gRPC; dispatch records
+each one in Redis and publishes it to Kafka; workers consume it, report
+progress back over a gRPC stream, retry failures within a budget, and send
+exhausted tasks to a dead-letter topic.
 
-![Go](https://img.shields.io/badge/Go-1.23-00ADD8?style=flat&logo=go&logoColor=white)
-![Kafka](https://img.shields.io/badge/Apache_Kafka-4.1-231F20?style=flat&logo=apache-kafka&logoColor=white)
-![Redis](https://img.shields.io/badge/Redis-7.2-DC382D?style=flat&logo=redis&logoColor=white)
-![Kubernetes](https://img.shields.io/badge/Kubernetes-HPA-326CE5?style=flat&logo=kubernetes&logoColor=white)
-![Prometheus](https://img.shields.io/badge/Prometheus-metrics-E6522C?style=flat&logo=prometheus&logoColor=white)
+**Execution is simulated.** A worker's "task" is a two-second timer that fails
+10% of the time. Everything around it is real: gRPC, Protobuf, Kafka, Redis,
+offset handling, retries, the dead-letter queue, and crash recovery.
 
----
+What it guarantees, and what it does not:
 
-## Architecture Highlights
+- **At-least-once delivery**, not exactly-once. A task can run more than once,
+  including concurrently on two workers around a consumer-group rebalance.
+- `ACCEPTED` means Kafka acknowledged the task and Redis recorded that. A
+  dispatch crash before then leaves a retained intent that dispatch republishes
+  after restart.
+- Durability is bounded by one Kafka broker (replication factor 1) and one Redis
+  (AOF, fsync every second). Redis data loss is not handled.
 
-This section explains the system design decisions — not just what it does, but *why* it works the way it does.
+Non-goals: real task execution, scheduling by priority or deadline,
+cancellation, a task-status query API, authentication/TLS, multi-broker Kafka,
+Redis Cluster.
 
-### Decoupled Microservice Design
+## Architecture
 
-Dispatch separates concerns across two independent binaries:
-
-- **`cmd/dispatch`** — the Ingestion API. A gRPC server that accepts task submissions, performs idempotency checks, persists state to Redis, and publishes serialized tasks (Protobuf) to a Kafka topic. It never executes tasks; its only job is to accept work reliably.
-- **`cmd/worker`** — the Worker Pool. Independently scalable consumers that read from Kafka, execute tasks, and stream progress updates back to the dispatch server via a long-lived bidirectional gRPC stream (`ReportProgress`). One stream handles multiple task updates, avoiding connection-per-task overhead.
-
-Tasks travel through the Kafka topic `tasks.pending`. Both services use Redis task records; workers report progress over the gRPC stream and reserve execution attempts in Redis.
-
-Both services honor `KAFKA_TOPIC` for the pending-work topic; its default is
-`tasks.pending`. Set the same value on dispatch and worker. The DLQ remains
-`tasks.dead_letter`; the worker exits at startup if `KAFKA_TOPIC` names it.
-
-Both services require Redis PING and a Kafka metadata response during startup.
-The Kafka probe has a ten-second deadline. Dispatch opens its gRPC listener only
-after that check, and the worker checks before consuming. The gRPC health status
-is a startup snapshot, not continuous dependency monitoring. This probe does not
-create topics or verify publishing permissions; topic provisioning remains a
-startup-orchestration requirement.
-
-### Delivery and Replay
-
-Kafka consumer groups resume from committed offsets. The worker stops on processing errors so a later commit cannot pass unresolved work. A new consumer session can fetch that work again.
-
-Execution can repeat if a worker exits after doing work but before recording completion. Replayed tasks already recorded COMPLETED are acknowledged without another execution. There is no exactly-once execution guarantee. Old Redis lock keys do not suppress replay or acknowledge unfinished work.
-
-Task creation and a retained publication intent are atomic. `ACCEPTED` requires
-both a Kafka acknowledgment and Redis confirmation of publication. A duplicate
-whose original publication is pending returns gRPC `Unavailable`; it does not
-publish a replacement payload. Retry with the same task ID/idempotency key.
-Publication errors and cancelled requests retain the original intent instead of
-rolling back the canonical task. A legacy record without publication evidence
-returns `FailedPrecondition` and needs inspection; it is not assumed published.
-
-Dispatch runs a supervised publication-recovery loop. Pending intents retain the
-original protobuf payload and topic; a topic-scoped Redis index schedules retries.
-Redis time and owner tokens fence claims and confirmations. A live owner has a
-15-second lease; publication attempts have a ten-second timeout. Failed writes
-are deferred by one second, and idle recovery polls every 200 ms. These are
-internal policies, not performance measurements.
-
-After a dispatch crash, expired intents are retried and confirmed only after a
-Kafka ACK. A crash or ambiguous timeout after Kafka receives a record can cause
-duplicate delivery. `Unavailable` therefore does not guarantee that no work was
-queued or executed; always retry with the same idempotency key. Once published,
-a duplicate returns the original ID and does not replace the canonical payload.
-Changing `KAFKA_TOPIC` does not reroute old pending intents. Redis should be
-isolated per Kafka environment; the intent binds a topic, not a Kafka cluster ID.
-
-Recovery requires retained Redis data. The current Compose file does not establish
-crash-safe Redis persistence, and no guarantee against Redis data loss is claimed.
-Corrupt intent/index data or recovery storage failures stop dispatch with an
-error rather than leave a healthy-looking service with a dead recovery loop.
-
-### Dead-Letter Queue (DLQ) for Poison-Pill Tasks
-
-The worker simulates task failures and quarantines exhausted valid task messages. Undecodable protobuf stops the worker without committing; it is not automatically dead-lettered and needs inspection.
-
-Dispatch uses a second Kafka topic, `tasks.dead_letter`, for exhausted tasks. `max_retries=N` permits at most **N+1 started attempts per task ID**:
-
-1. Before RUNNING, a Redis Lua script atomically reserves a start in the task hash's `attempts` field. Missing fields begin at zero; missing task records fail execution rather than being recreated.
-2. A simulated task failure reports FAILED and retries the same message before the reader advances. The original `max_retries` value is not decremented or republished.
-3. An exhausted budget publishes the original task to the DLQ. Only an acknowledged publication counts as handled. A missing publisher or rejected write stops the worker without committing the source message. A restart with an exhausted budget retries quarantine rather than executing another attempt.
-
-An interrupted start counts toward the budget, including an interruption before work begins. Attempt accounting survives worker restarts while the Redis record is retained. Redis persistence and retention bound this guarantee; this is not a guarantee against Redis data loss. DLQ records may be duplicated if a worker exits after publication but before committing the source offset.
-
-**A DLQ entry is not proof that a task failed.** When the same message is delivered to two workers at once (a rebalance can do this), both copies share one attempt budget, and exhaustion is decided from attempts *started*. One copy's failure can quarantine the task while the other copy's attempt is still running, and that attempt may then complete it. Nothing is lost, but the task ends COMPLETED *and* in the DLQ. Anything acting on the DLQ must check the task's status first. Fixing this would mean deciding exhaustion from attempts *finished*, which needs attempt leases so that a copy which crashes mid-attempt cannot strand the task. That is not implemented.
-
-### Offset Management as a Reliability Guarantee
-
-Kafka consumer groups track one committed offset per partition. Committing a later message also acknowledges earlier messages in that partition. When `processMessage` returns an error, the consumer stops instead of fetching later work:
-
-```go
-return fmt.Errorf("processing message from %s[%d] at offset %d: %w",
-    msg.Topic, msg.Partition, msg.Offset, err)
+```text
+client ──SubmitTask──▶ dispatch :50051 ──publish (acks=all)──▶ Kafka tasks.pending
+                          │  ▲                                       │
+          admit / confirm │  │ ReportProgress (one stream per worker)│ consumer group
+                          ▼  │                                       ▼
+                       Redis :6379  ◀── reserve attempts ──────── worker(s)
+                                                                     │ budget exhausted
+                                                                     ▼
+                                                            Kafka tasks.dead_letter
+dispatch metrics :9090      worker-1 metrics :9091      (optional) Prometheus :9093, Grafana :3000
 ```
 
-The worker closes its reader and exits nonzero on that error. This prevents a later commit from passing the failed message. Real-Kafka integration tests verify the committed offset and that a new reader in the same group can fetch the unresolved message. Cancellation shuts down without committing interrupted work.
+**Submitting a task.** Dispatch validates the request and atomically writes
+three things in Redis: the task record, a publication intent holding the exact
+task bytes, and an entry in a recovery index. It then publishes to Kafka and
+waits for the acknowledgement. Only after it has confirmed that in Redis does
+it return `ACCEPTED`. If Kafka fails, the task and its intent stay, and a
+recovery loop inside dispatch retries them, including after dispatch
+restarts.
 
-Errors from `FetchMessage` itself are different: nothing has been fetched, and kafka-go keeps rejoining the group after reporting a group error such as `RebalanceInProgress`. The worker retries them with backoff (250 ms up to 2 s) and exits only if fetches keep failing for 60 s. During a rebalance, closing the reader on shutdown was observed to take up to about 30 s.
+**Running a task.** A worker reads the next message and skips a task that is
+already COMPLETED. Otherwise it atomically reserves an attempt in Redis
+(`max_retries + 1` at most), reports RUNNING, waits two seconds, then reports
+COMPLETED or FAILED. Each report must come back `recorded=true`. A failure
+retries the same message. An exhausted budget publishes the task to
+`tasks.dead_letter`. The offset is committed only after one of those outcomes,
+so a worker that stops mid-task leaves the message to be delivered again.
 
-Progress updates require `recorded=true`, including FAILED updates for exhausted replays. A successful gRPC exchange with `recorded=false` means the state update was rejected: the worker stops with an error and leaves the source message uncommitted. The one exception is a task another delivery has already completed (a rebalance can hand an in-flight message to a second worker): the worker re-reads the task, finds it COMPLETED, and treats its duplicate as handled. Transport errors also stop consumption. Each update must be acknowledged within ten seconds; a silent dispatch peer aborts the stream and stops the worker rather than leaving it blocked. The stream is not reconnected. A started attempt remains counted; rejecting RUNNING prevents work, while rejecting COMPLETED can occur after work has already happened.
+## Quickstart
 
-Worker progress accepts RUNNING, FAILED, and COMPLETED only, with percentages
-in 0–100; COMPLETED requires exactly 100. PENDING is assigned by submission,
-and cancellation is not implemented. Unsupported statuses are rejected without
-changing the task record.
+| Requirement | Needed for | Without it |
+|---|---|---|
+| Docker with Compose v2 | Kafka, Redis, monitoring | nothing starts |
+| Go ≥ 1.23.0 | building the binaries | `make up` stops at preflight (no `go`) or at the build (older Go) |
+| bash 4+, Linux | `scripts/stack.sh` | only tested on Linux (WSL2 and GitHub's Ubuntu runners) |
+| `grpcurl` (optional) | submitting tasks by hand | use any gRPC client; reflection is enabled |
+| `curl` (optional) | `make test-stack` | that test cannot run |
 
-Redis checks task existence and writes progress atomically. If deletion wins before the update, the update is rejected without recreating a partial task record. Progress updates cannot reverse COMPLETED; repeating COMPLETED/100 leaves the record and completion time unchanged. FAILED may return to RUNNING for a retry. Intermediate updates are not attempt-fenced.
-
----
-
-## Tech Stack
-
-- **Go 1.23** — statically compiled, single-binary services with structured logging via `log/slog`
-- **Apache Kafka 4.1** — durable, ordered message log for task queuing and DLQ
-- **Redis 7.2** — task state and atomic started-attempt accounting
-- **gRPC + Protobuf** — typed, bidirectional streaming API between dispatch server and workers
-- **Prometheus + Grafana** — metrics collection and dashboarding
-- **Docker + Kubernetes** — multi-stage container builds, Deployments, Services, and HPA
-
----
-
-## Local Quickstart
-
-### Prerequisites
-
-- Docker with the Compose v2 plugin
-- Go 1.23.0 or newer
-- [`grpcurl`](https://github.com/fullstorydev/grpcurl), only for submitting tasks by hand
-
-### 1. Start the stack
+Start everything, in the foreground:
 
 ```bash
 make up
 ```
 
-This runs `scripts/stack.sh` in the foreground. It checks tools and ports
-first, starts Redis and Kafka and waits for their healthchecks, creates
-`tasks.pending` and `tasks.dead_letter`, builds the binaries into
-`.stack/bin`, starts dispatch and waits for gRPC health, then starts a worker
-and waits until it has joined its consumer group. It prints `stack ready` when
-all of that holds. If any component exits or a container stops, the whole stack
-is stopped and the command exits 1, naming the cause.
+`make up` (`scripts/stack.sh`) works through these steps in order:
 
-Measured from a clean state on one machine (WSL2, Docker 29.8.0, Go 1.26.1;
-images and Go modules already downloaded): 42-45 s with an empty Go build
-cache, 31-32 s with a warm one. Most of the time goes to the Go build, Kafka's
-startup, and the worker's first consumer-group join on a new broker.
-`scripts/measure-startup.sh --delete-volumes` reproduces the measurement; it
-deletes this project's Kafka and Redis data on every run.
+1. Checks tools, ports and settings, and stops at once if anything is wrong.
+2. Starts Redis and Kafka and waits for their healthchecks.
+3. Creates `tasks.pending` and `tasks.dead_letter`.
+4. Builds the binaries into `.stack/bin`.
+5. Starts dispatch and waits for gRPC health `SERVING`.
+6. Starts the worker(s) and waits until the consumer group is `Stable` with all
+   of them.
 
-`WORKERS=N` starts N workers (default 1; 0 runs dispatch alone), and
-`KAFKA_PARTITIONS` sets the topic partition count used when the topics are
-first created. Workers beyond the partition count receive no work. Worker *i*
-serves metrics on `WORKER_METRICS_PORT + 10*(i-1)`, i.e. 9091, 9101, ...
+It then prints `stack ready in Ns`. From a clean state (volumes deleted, empty
+Go build cache) that took 39.7–40.9 s over 3 runs, and 26.6–28.4 s over 2 runs
+with a warm build cache. That is one machine: WSL2, Docker 29.8.0, Go 1.23.0,
+with the images and Go modules already downloaded. See
+[Benchmarks](#benchmarks) for how this was measured.
 
-Logs are in `.stack/logs`; follow them from a second terminal with
-`make logs`. Prometheus and Grafana are not started by `make up`.
-
-### 4. Submit a Task
+In a second terminal, submit a task:
 
 ```bash
-grpcurl -plaintext \
-  -d '{
-    "task": {
-      "type": "video_transcode",
-      "max_retries": 3,
-      "priority": "PRIORITY_HIGH",
-      "metadata": {"source": "grpcurl"}
-    }
-  }' \
-  localhost:50051 \
-  dispatch.v1.DispatchService/SubmitTask
+grpcurl -plaintext -d '{"task": {"idempotency_key": "demo-1", "type": "demo", "max_retries": 2}}' localhost:50051 dispatch.v1.DispatchService/SubmitTask
 ```
-
-Expected response:
 
 ```json
 {
   "status": "SUBMIT_STATUS_ACCEPTED",
-  "taskId": "a3f1c2d4-..."
+  "taskId": "demo-1"
 }
 ```
 
-To verify idempotency, supply the same `idempotency_key` in a second call — the server returns the original `task_id` without re-enqueuing.
+There is no status API. Read the task record in Redis instead (`status` 1 =
+PENDING, 2 = RUNNING, 3 = COMPLETED, 4 = FAILED):
 
-### Shutdown
+```bash
+docker compose exec redis redis-cli HGETALL task:demo-1
+```
 
-Press Ctrl-C (or send SIGTERM) to the `make up` terminal. The worker stops
-first, then dispatch, then the Redis and Kafka containers; their data stays on
-the `kafka-data` and `redis-data` volumes. A second Ctrl-C does not interrupt
-the shutdown. `scripts/stack.sh` exits 0 after a requested stop and 1 after a
-failure; through `make`, those appear as make's own `Interrupt` (130) and
-`Error 1` (exit 2). `scripts/test-stack.sh` checks these paths, and component death,
-against real containers.
+After about two seconds it shows `status 3`, `progress 100` and
+`publication_state published`. `attempts` is 2 if the first attempt hit the
+simulated failure. Submitting the same key again returns the same `taskId`,
+and the task is not queued again.
 
-Within dispatch, on SIGINT or SIGTERM, dispatch gives existing gRPC calls five seconds to drain.
-It then logs `forcing gRPC shutdown` and closes remaining connections, including
-workers' open progress streams. Closed streams drain without waiting for the
-deadline. The integration regression executes the actual `main` in a compiled
-subprocess, checks both paths, and verifies that its gRPC and metrics ports are
-released. This deadline bounds gRPC draining, not every dependency's cleanup.
+Stop with Ctrl-C in the `make up` terminal. The workers stop first, then
+dispatch, then the containers; data stays on the `kafka-data` and `redis-data`
+volumes. A second Ctrl-C does not interrupt the shutdown. If any component dies
+while running, the whole stack stops and the command exits nonzero, naming the
+component. Logs are in `.stack/logs`; `make logs` follows them.
 
----
+## API
 
-## Observability
+Defined in [`proto/task/v1/task.proto`](proto/task/v1/task.proto).
 
-### Prometheus Metrics
+### SubmitTask
 
-Both services expose a `/metrics` endpoint scraped by Prometheus every 15 seconds. Custom application metrics:
+`type` must be non-empty and `max_retries` must not be negative. `payload` and
+`metadata` are carried unchanged to Kafka and to the dead-letter topic.
+`priority` is stored and logged but does not affect order. The task ID is the
+`idempotency_key`, or a generated UUID if it is empty.
 
-| Metric | Type | Description |
+| Result | When | What to do |
 |---|---|---|
-| `tasks_submitted_total` | Counter | SubmitTask responses (retries count again), labeled `status=accepted\|pending\|rejected\|error`; `pending` is Unavailable with the intent retained for recovery |
-| `tasks_completed_total` | Counter | Successfully executed tasks |
-| `tasks_failed_total` | Counter | Failed simulated execution attempts |
-| `task_execution_duration_seconds` | Histogram | Per-attempt simulated execution duration; excludes queue wait |
+| `SUBMIT_STATUS_ACCEPTED` + `taskId` | Kafka acknowledged the task and Redis confirmed it; also for a repeated key whose task was already accepted | nothing. A repeat never replaces the original task |
+| `InvalidArgument` | no task, empty `type`, negative `max_retries` | fix the request |
+| `Unavailable` | Kafka did not acknowledge in time, or the same key is still being published | **not a failure.** The task is kept and dispatch keeps retrying. Retry the call with the same `idempotency_key` (the message includes the ID if one was generated) |
+| `FailedPrecondition` | the key belongs to a record with no publication evidence, or to another topic | inspect that record; it is never assumed published |
+| `Internal` | Redis read or write failed | retry once Redis is healthy |
 
-Both services require their metrics listener to bind during startup. An invalid
-or occupied metrics address exits with status 1 and identifies the address in
-the error; choose an unused `METRICS_PORT` or stop the process holding that port.
-Errors after the metrics HTTP server has started are currently logged rather
-than propagated to the main service.
+`Unavailable` does not mean nothing was queued: Kafka may have stored the task
+before the failure. Retrying with the same key is always safe.
 
-### Grafana
+### ReportProgress (worker → dispatch)
 
-Navigate to `http://localhost:3000` (credentials: `admin` / `admin`).
+A bidirectional stream; one per worker, carrying updates for many tasks. Each
+update gets one `ProgressAck`. Accepted statuses are RUNNING, FAILED and
+COMPLETED, with progress 0–100; COMPLETED requires 100. `recorded=false` means
+the update changed nothing: unknown task, invalid status or progress, the task
+is already COMPLETED, or Redis failed. A repeated COMPLETED/100 is recorded and
+changes nothing. The worker treats `recorded=false` as fatal, except when it
+re-reads the task and finds it already COMPLETED by another delivery, which it
+counts as handled. Each update must be acknowledged within 10 s.
 
-Add a Prometheus data source pointing to `http://prometheus:9090`, then build dashboards using the metrics above. Key panels to track:
+## Failure behavior
 
-- **Throughput**: `rate(tasks_completed_total[1m])`
-- **Error rate**: `rate(tasks_failed_total[1m]) / rate(tasks_submitted_total[1m])`
-- **P99 execution latency**: `histogram_quantile(0.99, rate(task_execution_duration_seconds_bucket[5m]))`
+| Situation | Behavior |
+|---|---|
+| Kafka refuses or loses a publish | task stays pending in Redis; dispatch republishes it (1 s back-off) |
+| dispatch killed mid-publish | on restart, an unexpired claim waits out its 15 s lease, then the intent is republished. A crash after Kafka's acknowledgement can publish the task twice |
+| worker killed mid-task | the uncommitted message is redelivered; the interrupted attempt still counts toward the budget |
+| task fails `max_retries + 1` times | published to `tasks.dead_letter` with its original payload and committed. A DLQ write failure stops the worker without committing |
+| same message delivered twice | a COMPLETED task is skipped without a new attempt. Two concurrent copies share one attempt budget, so a task can end COMPLETED **and** in the DLQ (measured at 4.95% when every task was duplicated) |
+| undecodable Kafka message | the worker stops without committing; nothing quarantines it |
+| consumer-group rebalance | fetch errors are retried for up to 60 s before the worker exits |
+| Redis unreachable | dispatch exits within seconds (its recovery loop needs Redis); a worker exits at its next message |
+| dispatch unreachable from a worker | the worker exits; progress streams are not reconnected |
 
----
+Each row is covered by an integration test against real Kafka and Redis
+(`make test-integration`), with two exceptions:
 
-## Kubernetes Deployment
+- The rebalance retry has a unit test, and 12 real occurrences were seen in
+  the concurrent-duplicate soak.
+- A worker losing Redis is untested; that row is read from the code.
 
-The repository includes Kubernetes manifests in `k8s/` and multi-stage Dockerfiles in `build/`. The manifests have not been applied to a cluster. They do not deploy Redis or Kafka; they expect `redis` and `kafka` Services in the `default` namespace.
+## Configuration
 
-### Build Images
+Dispatch (`cmd/dispatch`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PORT` | `50051` | gRPC listen port |
+| `METRICS_PORT` | `9090` | Prometheus `/metrics` port; must bind at startup |
+| `KAFKA_BROKER` | `localhost:9092` | must answer a metadata request within 10 s at startup |
+| `KAFKA_TOPIC` | `tasks.pending` | topic tasks are published to |
+| `REDIS_ADDR` | `localhost:6379` | must answer PING at startup |
+
+Worker (`cmd/worker`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GRPC_SERVER_ADDR` | `localhost:50051` | dispatch address; must be reachable at startup |
+| `METRICS_PORT` | `9091` | Prometheus `/metrics` port |
+| `KAFKA_BROKER` | `localhost:9092` | |
+| `KAFKA_TOPIC` | `tasks.pending` | must match dispatch, and must not be `tasks.dead_letter` |
+| `KAFKA_GROUP_ID` | `dispatch-workers` | consumer group |
+| `REDIS_ADDR` | `localhost:6379` | |
+
+The dead-letter topic is fixed at `tasks.dead_letter`. `make up` additionally
+reads:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WORKERS` | `1` | number of workers; `0` runs dispatch alone |
+| `KAFKA_PARTITIONS` | `1` | partitions when topics are first created; workers beyond this get no work |
+| `DISPATCH_METRICS_PORT` | `9090` | dispatch metrics port |
+| `WORKER_METRICS_PORT` | `9091` | worker *i* uses this + 10·(i−1): 9091, 9101, … |
+| `READY_TIMEOUT` / `STOP_TIMEOUT` | `120` / `15` | seconds to wait for readiness / for each component to stop |
+| `KEEP_INFRA` | `0` | `1` leaves Kafka and Redis running after shutdown |
+
+Redis holds `task:<id>` (the task record), `publication:<id>` (the retained
+intent until confirmed) and `outbox:<topic>` (the recovery index). Records are
+never expired.
+
+## Monitoring (optional)
+
+```bash
+docker compose up -d prometheus grafana
+```
+
+Prometheus (http://localhost:9093) scrapes dispatch on :9090 and the first
+worker on :9091. Additional workers are not scraped. Grafana
+(http://localhost:3000, `admin`/`admin`) comes up with Prometheus as its data
+source. Both processes export all four metrics, so filter by `job`:
+
+| Query | Shows |
+|---|---|
+| `tasks_submitted_total{job="dispatch-server"}` | SubmitTask responses by `status`: `accepted`, `pending` (Unavailable), `rejected`, `error`. Retries count again |
+| `rate(tasks_completed_total{job="dispatch-worker"}[5m])` | completed tasks per second |
+| `rate(tasks_failed_total{job="dispatch-worker"}[5m]) / (rate(tasks_failed_total{job="dispatch-worker"}[5m]) + rate(tasks_completed_total{job="dispatch-worker"}[5m]))` | share of finished attempts that failed |
+| `histogram_quantile(0.99, sum by (le) (rate(task_execution_duration_seconds_bucket{job="dispatch-worker"}[5m])))` | p99 attempt duration: about 2 s, the simulated work |
+
+## Containers and Kubernetes
 
 ```bash
 make docker-build
 ```
 
-This builds both `dispatch-server:latest` and `dispatch-worker:latest` using `golang:1.23-alpine` builder stages and minimal `alpine:latest` runtime images. Binaries run as a non-root user.
-
-### Apply Manifests
-
-```bash
-kubectl apply -f k8s/
-```
-
-| Manifest | Resource | Details |
-|---|---|---|
-| `dispatch-server.yaml` | Deployment + Service | 2 replicas, 100m CPU / 128Mi, exposes gRPC :50051 |
-| `dispatch-worker.yaml` | Deployment | 2 replicas, 100m CPU / 128Mi, connects to dispatch-server via cluster DNS |
-| `worker-hpa.yaml` | HorizontalPodAutoscaler | Scales workers 2–10 replicas at 70% CPU utilization |
-
-The HPA requests CPU-based worker scaling. Cluster deployment and scaling behavior have not been verified.
-
----
-
-## Project Layout
-
-```
-.
-├── build/
-│   ├── Dockerfile.dispatch     # Multi-stage build for the dispatch server
-│   └── Dockerfile.worker       # Multi-stage build for the worker
-├── cmd/
-│   ├── dispatch/main.go        # Dispatch server entrypoint
-│   └── worker/main.go          # Worker entrypoint
-├── gen/                        # Generated Protobuf Go bindings
-├── internal/
-│   ├── broker/                 # Kafka producer abstraction
-│   ├── metrics/                # Prometheus metric definitions
-│   ├── server/                 # gRPC DispatchService implementation
-│   ├── state/                  # Redis task store
-│   └── worker/                 # Kafka consumer, progress reporter
-├── k8s/                        # Kubernetes manifests
-├── proto/task/v1/task.proto    # Protobuf service definition
-├── docker-compose.yml
-└── Makefile
-```
-
-## Makefile Reference
-
-```bash
-make setup          # Install protoc plugins, generate bindings, tidy
-make generate       # Compile task.proto → Go bindings
-make build          # Build dispatch server binary
-make build-worker   # Build worker binary
-make up             # Start and supervise the whole stack (see Local Quickstart)
-make logs           # Follow the stack's logs
-make lint           # gofmt diff, go vet (both build tags), go mod verify, go mod tidy -diff
-make test           # Unit tier, race detector; no Kafka/Redis needed
-make test-integration  # Full tier against real Kafka/Redis; fails on any skip
-make test-stack     # Drive `make up` end to end (needs curl and grpcurl)
-make docker-build   # Build both Docker images
-make clean          # Remove generated artifacts and binaries
-```
+This builds `dispatch-server:latest` and `dispatch-worker:latest` (Go 1.23
+Alpine builder, Alpine runtime, non-root `appuser`). Both images were run
+against the Compose Kafka and Redis: dispatch reached gRPC health `SERVING`
+and the worker joined its group. The manifests in `k8s/` (two Deployments, a
+Service and a CPU-based HPA) have never been applied to a cluster, and they
+expect existing `redis` and `kafka` Services.
 
 ## Benchmarks
 
-Measured on one laptop with the load generator on the same machine
-(details, method and caveats in [docs/BENCHMARKS.md](docs/BENCHMARKS.md)):
+Measured on one laptop with the load generator on the same machine. Method,
+environment and caveats are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-- `SubmitTask` held p95 ≤ 50 ms at 6,000 req/s in 7 of 7 runs (p95 14-16 ms)
-  and at 7,000 req/s in 3 of 3; above that the boundary is noisy. Across
-  20.2 million requests every response was `ACCEPTED`, and every accepted
-  task was verified in Kafka exactly once.
-- Soaks lost no task: 20,000 tasks through 32 workers (19,769 completed,
-  231 in the DLQ); every message then delivered a second time with zero new
-  executions; and 10,000 tasks each executed twice concurrently, where 924
-  duplicates were absorbed. That run also measured a documented limitation:
-  4.95% of tasks ended both COMPLETED and in the DLQ.
+- `SubmitTask` held p95 ≤ 50 ms at 6,000 req/s in 7 of 7 runs (p95
+  14.0–16.4 ms) and at 7,000 req/s in 3 of 3. Above that the limit is noisy.
+  Across 20.2 million requests every response was `ACCEPTED`, and every
+  accepted task was verified in Kafka.
+- 20,000 tasks through 32 workers: none lost (19,769 completed, 231 in the
+  DLQ). Delivering every message a second time started no new attempts. With
+  every task executed by two workers at once, none was lost and 924 duplicates
+  were absorbed.
+- Worker throughput is not measured: it would only reflect the two-second
+  timer.
 
-Worker throughput is not benchmarked: a task is a two-second simulated timer.
+Startup times come from `scripts/measure-startup.sh --delete-volumes`, which
+deletes this project's Kafka and Redis data on every run.
 
-## Tests
-
-Two tiers. The unit tier needs nothing running:
-
-```bash
-make test
-```
-
-The integration tier (`-tags=integration`) runs every test, including the unit
-tier, against real Kafka and Redis. Start them first with the same Compose file
-the stack uses:
+## Tests and CI
 
 ```bash
+make lint                                  # gofmt, go vet (both build tags), go mod verify, go mod tidy -diff
+make test                                  # unit tier, race detector, needs nothing running
 docker compose up -d --wait kafka redis
-make test-integration
+make test-integration                      # every test against real Kafka and Redis
+make test-stack                            # drives `make up` end to end (needs curl and grpcurl)
+make lint-scripts                          # ShellCheck + actionlint (needs Docker and actionlint v1.7.7)
 ```
 
-`make test-integration` writes `go test -json` output to `test-results.json` and
-prints top-level and leaf test counts plus the full output of anything that
-failed. **A skipped test fails the run**: a skip in this tier would mean missing
-infrastructure was reported as a pass. Integration tests fail, not skip, when
-Kafka or Redis is unreachable. They default to `localhost:9092` and
-`localhost:6379` and accept `KAFKA_BROKER` and `REDIS_ADDR` as overrides. Kafka
-tests create uniquely named topics and delete them at cleanup.
+Integration tests fail, not skip, when Kafka or Redis is missing.
+`make test-integration` also fails if any test is skipped, and prints the full
+output of anything that failed. Tests default to `localhost:9092` and
+`localhost:6379` (override with `KAFKA_BROKER` / `REDIS_ADDR`) and create and
+delete their own uniquely named Kafka topics.
 
-`make test-stack` runs `scripts/test-stack.sh`. It starts the real stack several
-times and checks preflight rejections, a task completing, Ctrl-C, SIGTERM,
-component and Kafka death, and multi-worker startup. Afterwards it checks for
-orphaned processes and held ports.
+GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs
+three jobs on Go 1.23.0, the `go.mod` minimum:
 
-### CI
+1. lint, unit tests and script lint;
+2. the integration tier against Kafka and Redis from this repository's
+   `docker-compose.yml`;
+3. `make test-stack`.
 
-`.github/workflows/ci.yml` runs three jobs on Go 1.23.0 (the `go.mod` minimum,
-with `GOTOOLCHAIN=local`):
+## Layout
 
-- **checks**: `make lint`, `make test`
-- **integration**: `docker compose up -d --wait kafka redis`, then
-  `make test-integration`. It uses the same Compose file as local development,
-  not GitHub `services:`, which cannot set Redis's AOF command.
-- **stack**: `make test-stack`
+```text
+cmd/dispatch/        gRPC server: admission, publication recovery, progress
+cmd/worker/          Kafka consumer, progress reporter, DLQ publisher
+cmd/healthcheck/     gRPC health probe used by scripts/stack.sh
+internal/server/     SubmitTask, ReportProgress, publication recovery loop
+internal/state/      Redis store and its Lua scripts
+internal/worker/     consumer loop, retry budget, progress client
+internal/broker/     Kafka producer and startup readiness probe
+internal/metrics/    Prometheus metrics and HTTP server
+internal/testutil/   integration fixtures (real Kafka/Redis, subprocesses)
+proto/, gen/         task.proto and the generated Go code
+scripts/             stack.sh, test-stack.sh, measure-startup.sh, bench/, ci/
+docs/BENCHMARKS.md   load tests and soaks
+build/, k8s/         Dockerfiles; unverified Kubernetes manifests
+docker-compose.yml   Kafka, Redis, optional Prometheus and Grafana
+```
 
-On failure, the integration and stack jobs print Kafka and Redis logs and
-upload test output and component logs as artifacts.
+Regenerating `gen/` needs protoc 3.21.12 and the plugin versions installed by
+`make install-tools`, then `make generate`. The generated code is committed,
+so building and testing do not need protoc.
