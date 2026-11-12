@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Checks are written `condition && pass ... || fail ...` (and the inverse).
+# That is only an if/else because pass and fail always return 0.
+# shellcheck disable=SC2015
 # Exercises scripts/stack.sh end to end against real Docker, Kafka and Redis:
 # readiness, a submitted task completing, Ctrl-C shutdown, component death,
 # infrastructure death, and preflight failures. Each scenario checks for
@@ -29,11 +32,19 @@ cleanup() {
 trap cleanup EXIT
 
 say() { printf '\n=== %s\n' "$*"; }
-pass() { echo "PASS: $*"; PASSED=$((PASSED + 1)); }
+pass() {
+	echo "PASS: $*"
+	PASSED=$((PASSED + 1))
+	return 0
+}
 fail() {
 	echo "FAIL: $*"
 	FAILED=$((FAILED + 1))
-	[[ -f $WORK/out ]] && { echo "--- stack output"; tail -n 30 "$WORK/out"; }
+	if [[ -f $WORK/out ]]; then
+		echo "--- stack output"
+		tail -n 30 "$WORK/out" || true
+	fi
+	return 0
 }
 
 # Start stack.sh as its own job; its process group then receives the emulated
@@ -45,7 +56,7 @@ start_stack() {
 }
 
 wait_for_output() {
-	local pattern=$1 timeout=$2 deadline=$((SECONDS + $2))
+	local pattern=$1 deadline=$((SECONDS + $2))
 	until grep -q "$pattern" "$WORK/out"; do
 		kill -0 "$STACK_PID" 2>/dev/null || return 1
 		((SECONDS < deadline)) || return 1
@@ -74,12 +85,12 @@ port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 
 # assert_clean: no binaries from this stack still running and no ports held.
 assert_clean() {
-	local what=$1 leftovers port held=()
-	leftovers=$(pgrep -f "$STACK_DIR/bin/" || true)
+	local what=$1 leftovers=() port held=()
+	mapfile -t leftovers < <(pgrep -f "$STACK_DIR/bin/" || true)
 	for port in "${PORTS[@]}"; do port_in_use "$port" && held+=("$port"); done
-	if [[ -n $leftovers ]]; then
-		fail "$what: orphaned processes $(echo $leftovers)"
-		kill -KILL $leftovers 2>/dev/null || true
+	if ((${#leftovers[@]})); then
+		fail "$what: orphaned processes ${leftovers[*]}"
+		kill -KILL "${leftovers[@]}" 2>/dev/null || true
 	elif ((${#held[@]})); then
 		fail "$what: ports still held: ${held[*]}"
 	else

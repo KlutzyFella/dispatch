@@ -78,7 +78,9 @@ preflight() {
 	local name value
 	for name in PORT DISPATCH_METRICS_PORT WORKER_METRICS_PORT; do
 		value=${!name}
-		[[ $value =~ ^[0-9]+$ ]] && ((value > 0 && value + 10 * WORKERS < 65536)) || die "$name must be a TCP port, got '$value'"
+		if ! [[ $value =~ ^[0-9]+$ ]] || ((value == 0 || value + 10 * WORKERS >= 65536)); then
+			die "$name must be a TCP port, got '$value'"
+		fi
 	done
 	local ports=("$PORT" "$DISPATCH_METRICS_PORT") i
 	for ((i = 1; i <= WORKERS; i++)); do ports+=("$(worker_metrics_port "$i")"); done

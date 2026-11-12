@@ -2,7 +2,7 @@ PROTO_DIR := proto
 GEN_DIR   := gen
 BIN_DIR   := bin
 
-.PHONY: install-tools generate build build-worker test test-integration test-stack lint run run-worker up logs clean setup docker-build
+.PHONY: install-tools generate build build-worker test test-integration test-stack lint lint-scripts run run-worker up logs clean setup docker-build
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
@@ -64,6 +64,13 @@ lint:
 	go vet -tags=integration ./...
 	go mod verify
 	go mod tidy -diff
+
+## lint-scripts: ShellCheck (pinned Docker image) over the shell scripts, and
+##     actionlint over the workflow, including ShellCheck on its run: blocks.
+##     Needs Docker and actionlint v1.7.7.
+lint-scripts:
+	./scripts/ci/shellcheck scripts/*.sh scripts/ci/shellcheck
+	actionlint -shellcheck scripts/ci/shellcheck .github/workflows/ci.yml
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 

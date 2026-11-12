@@ -1,0 +1,4 @@
+#!/bin/sh
+# Runs ShellCheck from one pinned image everywhere (locally, in CI, and when
+# actionlint lints workflow run: blocks), so results cannot drift by version.
+exec docker run --rm -i -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.10.0 "$@"

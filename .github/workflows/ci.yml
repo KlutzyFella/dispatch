@@ -34,6 +34,12 @@ jobs:
         run: make test
       - name: Python helper scripts compile
         run: python3 -m py_compile scripts/ci/*.py scripts/bench/*.py
+      # A lint tool, not project code: GOTOOLCHAIN=auto lets Go satisfy
+      # actionlint's own go.mod.
+      - name: Install actionlint
+        run: GOTOOLCHAIN=auto go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+      - name: ShellCheck scripts and actionlint the workflow
+        run: make lint-scripts
 
   integration:
     name: Integration tests (real Kafka and Redis)
