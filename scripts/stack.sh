@@ -164,6 +164,13 @@ workers_joined() {
 		awk -v g="$KAFKA_GROUP_ID" -v n="$1" '$1 == g { count++ } END { exit !(count >= n) }' "$PROBE"
 }
 
+# group_stable N: the consumer group has finished rebalancing with exactly N
+# members, so every partition is assigned and no handoff is in progress.
+group_stable() {
+	kafka_cli kafka-consumer-groups.sh --describe --group "$KAFKA_GROUP_ID" --state >"$PROBE" 2>/dev/null &&
+		awk -v g="$KAFKA_GROUP_ID" -v n="$1" '$1 == g && $(NF - 1) == "Stable" && $NF == n { ok = 1 } END { exit !ok }' "$PROBE"
+}
+
 start_dispatch() {
 	log "starting dispatch (gRPC :$PORT, metrics :$DISPATCH_METRICS_PORT)"
 	PORT=$PORT METRICS_PORT=$DISPATCH_METRICS_PORT KAFKA_TOPIC=$KAFKA_TOPIC \
@@ -184,6 +191,21 @@ start_workers() {
 		wait_until "$name" "${PIDS[$name]}" workers_joined "$i"
 		log "$name ready (pid ${PIDS[$name]}, joined consumer group $KAFKA_GROUP_ID)"
 	done
+	((WORKERS > 0)) || return 0
+	# Each join triggers a rebalance. Reporting ready mid-rebalance lets the
+	# first tasks be handed between workers while in flight.
+	local deadline=$((SECONDS + READY_TIMEOUT))
+	until group_stable "$WORKERS"; do
+		for name in "${!PIDS[@]}"; do
+			if [[ $name == worker-* ]] && ! kill -0 "${PIDS[$name]}" 2>/dev/null; then
+				report_exit "$name" "${PIDS[$name]}"
+				die "$name exited while the consumer group was rebalancing"
+			fi
+		done
+		((SECONDS < deadline)) || die "consumer group $KAFKA_GROUP_ID not Stable with $WORKERS members after ${READY_TIMEOUT}s"
+		pause 0.5
+	done
+	log "consumer group $KAFKA_GROUP_ID stable with $WORKERS member(s)"
 }
 
 # ── Supervision and shutdown ───────────────────────────────────────────────────

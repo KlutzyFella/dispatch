@@ -209,6 +209,14 @@ scenario_workers() {
 	say "WORKERS=3 on 3 partitions"
 	start_stack WORKERS=3 KAFKA_PARTITIONS=3
 	wait_for_output 'stack ready' 180 || { fail "stack never became ready"; stop_stack; return; }
+	# Query first, immediately: a check after other slow queries would give a
+	# rebalance still in progress time to finish and hide it.
+	local state
+	state=$(docker compose --project-directory "$ROOT" exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+		--bootstrap-server localhost:9092 --describe --group dispatch-workers --state 2>/dev/null |
+		awk '$1 == "dispatch-workers" { print $(NF - 1), $NF }')
+	[[ $state == "Stable 3" ]] && pass "group Stable with 3 members when ready was reported" ||
+		fail "group was '$state' when ready was reported, want 'Stable 3'"
 	local members
 	members=$(docker compose --project-directory "$ROOT" exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
 		--bootstrap-server localhost:9092 --describe --group dispatch-workers --members 2>/dev/null | awk '$1 == "dispatch-workers"' | wc -l)
