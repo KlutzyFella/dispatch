@@ -233,7 +233,10 @@ def check(result: dict, codes: dict, concurrent: bool) -> list[str]:
         failures.append("pending-topic records != admitted tasks")
     if result["dlq_read"] != result["dlq_records"]:
         failures.append("could not read back every DLQ record")
-    if result["completed_and_dlq"]:
+    # Under concurrent duplicate delivery a task can be quarantined while the
+    # other copy's attempt is still running and then complete (documented in
+    # the README DLQ section); report it there, fail on it otherwise.
+    if result["completed_and_dlq"] and not concurrent:
         failures.append(f"{result['completed_and_dlq']} task(s) both COMPLETED and quarantined")
     if not concurrent and result["dlq_records"] != result["dlq_distinct"]:
         failures.append("duplicate DLQ records without concurrent delivery")

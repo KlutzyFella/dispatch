@@ -80,6 +80,8 @@ Dispatch uses a second Kafka topic, `tasks.dead_letter`, for exhausted tasks. `m
 
 An interrupted start counts toward the budget, including an interruption before work begins. Attempt accounting survives worker restarts while the Redis record is retained. Redis persistence and retention bound this guarantee; this is not a guarantee against Redis data loss. DLQ records may be duplicated if a worker exits after publication but before committing the source offset.
 
+**A DLQ entry is not proof that a task failed.** When the same message is delivered to two workers at once (a rebalance can do this), both copies share one attempt budget, and exhaustion is decided from attempts *started*. One copy's failure can quarantine the task while the other copy's attempt is still running, and that attempt may then complete it. Nothing is lost, but the task ends COMPLETED *and* in the DLQ. Anything acting on the DLQ must check the task's status first. Fixing this would mean deciding exhaustion from attempts *finished*, which needs attempt leases so that a copy which crashes mid-attempt cannot strand the task. That is not implemented.
+
 ### Offset Management as a Reliability Guarantee
 
 Kafka consumer groups track one committed offset per partition. Committing a later message also acknowledges earlier messages in that partition. When `processMessage` returns an error, the consumer stops instead of fetching later work:
