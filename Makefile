@@ -88,7 +88,7 @@ logs:
 
 ## clean: remove generated artifacts and compiled binaries
 clean:
-	rm -rf $(BIN_DIR) $(GEN_DIR) coverage.out
+	rm -rf $(BIN_DIR) $(GEN_DIR)
 
 # ── Docker ────────────────────────────────────────────────────────────────────
 
