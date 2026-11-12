@@ -4,9 +4,8 @@ package dispatch.v1;
 
 option go_package = "github.com/ronnitchopra/dispatch/gen/task/v1;taskv1";
 
-import "google/protobuf/timestamp.proto";
-
-// Priority levels for task scheduling.
+// Priority is recorded with the task and logged. Nothing schedules by it:
+// Kafka delivers tasks in partition order regardless of priority.
 enum Priority {
   PRIORITY_UNSPECIFIED = 0;
   PRIORITY_LOW         = 1;
@@ -15,44 +14,48 @@ enum Priority {
   PRIORITY_CRITICAL    = 4;
 }
 
-// TaskStatus represents the lifecycle state of a task.
+// TaskStatus is the lifecycle state stored for a task. Submission sets PENDING;
+// workers report RUNNING, FAILED and COMPLETED. COMPLETED is terminal.
 enum TaskStatus {
   TASK_STATUS_UNSPECIFIED = 0;
   TASK_STATUS_PENDING     = 1;
   TASK_STATUS_RUNNING     = 2;
   TASK_STATUS_COMPLETED   = 3;
   TASK_STATUS_FAILED      = 4;
-  TASK_STATUS_CANCELLED   = 5;
+  // 5 was CANCELLED; cancellation was never implemented.
+  reserved 5;
+  reserved "TASK_STATUS_CANCELLED";
 }
 
-// SubmitStatus is the server's verdict on a task submission.
+// SubmitStatus is set only on success. Every refusal or failure is a gRPC
+// status code instead (InvalidArgument, FailedPrecondition, Unavailable, Internal).
 enum SubmitStatus {
   SUBMIT_STATUS_UNSPECIFIED = 0;
   SUBMIT_STATUS_ACCEPTED    = 1;
-  SUBMIT_STATUS_REJECTED    = 2;
+  // 2 was REJECTED; refusals are reported as gRPC status codes.
+  reserved 2;
+  reserved "SUBMIT_STATUS_REJECTED";
 }
 
-// Task is the core unit of work submitted by a client.
+// Task is the unit of work a client submits.
 message Task {
-  // Client-supplied idempotency key. If empty, the server generates a UUID.
-  // Resubmitting the same key returns the original task_id (at-least-once safety).
+  // Client-supplied idempotency key, which becomes the task ID. If empty, the
+  // server generates a UUID. Resubmitting a key returns the original task ID
+  // and never replaces the original task.
   string idempotency_key = 1;
-
-  // Machine-readable task type consumed by the worker (e.g. "video_transcode").
+  // Required, non-empty. Recorded and logged; workers do not branch on it.
   string type = 2;
-
-  // Opaque payload; the worker deserializes it based on `type`.
+  // Opaque bytes, carried unchanged to Kafka and to the dead-letter topic.
+  // The simulated workers do not interpret it.
   bytes payload = 3;
-
   Priority priority = 4;
-
-  // Absolute deadline; the scheduler must not dispatch the task after this time.
-  google.protobuf.Timestamp deadline = 5;
-
-  // Arbitrary key-value labels for tracing, routing, and observability.
+  // 5 was deadline; nothing enforced it.
+  reserved 5;
+  reserved "deadline";
+  // Opaque labels, carried unchanged with the task. Not used for routing.
   map<string, string> metadata = 6;
-
-  // Maximum number of automatic retry attempts on failure.
+  // Retries after a failed attempt: at most max_retries + 1 attempts start.
+  // Must not be negative.
   int32 max_retries = 7;
 }
 
@@ -62,13 +65,11 @@ message SubmitTaskRequest {
 
 message SubmitTaskResponse {
   SubmitStatus status = 1;
-
-  // Canonical task ID: either the provided idempotency_key or a server-generated UUID.
+  // Canonical task ID: the idempotency_key if given, else a generated UUID.
   string task_id = 2;
-
-  // Human-readable business-logic rejection reason (populated only when REJECTED).
-  // Use standard gRPC status codes for network/auth failures.
-  string error_message = 3;
+  // 3 was error_message; refusals are reported as gRPC status codes.
+  reserved 3;
+  reserved "error_message";
 }
 
 // ProgressUpdate is sent by a worker to report status on a task.
@@ -76,26 +77,27 @@ message SubmitTaskResponse {
 message ProgressUpdate {
   string worker_id = 1;
   string task_id   = 2;
-
   TaskStatus status = 3;
-
-  // Completion percentage: 0–100.
+  // Completion percentage, 0–100. COMPLETED requires 100.
   int32 progress = 4;
-
-  google.protobuf.Timestamp timestamp = 5;
+  // 5 was timestamp; the server records its own time.
+  reserved 5;
+  reserved "timestamp";
 }
 
-// ProgressAck is the server's acknowledgment that a progress update was recorded.
+// ProgressAck answers each ProgressUpdate. recorded=false means the update was
+// refused (unknown task, invalid status or progress, task already COMPLETED,
+// or a storage error) and the stored task is unchanged.
 message ProgressAck {
   bool recorded = 1;
 }
 
-// DispatchService is the core scheduling API.
+// DispatchService accepts tasks and records worker progress.
 service DispatchService {
-  // SubmitTask accepts a job from a client and returns an assigned task ID.
+  // SubmitTask admits a task and returns ACCEPTED only after Kafka has
+  // acknowledged it; see the README for the gRPC status codes it returns.
   rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
-
   // ReportProgress is a bidirectional stream. A worker opens one long-lived
-  // stream and sends progress updates for multiple tasks; the server acknowledges each.
+  // stream and sends updates for many tasks; the server acknowledges each.
   rpc ReportProgress(stream ProgressUpdate) returns (stream ProgressAck);
 }

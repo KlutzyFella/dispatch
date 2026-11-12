@@ -640,7 +640,8 @@ func TestReportProgress_RejectsUnsupportedState(t *testing.T) {
 		{name: "unknown", status: taskv1.TaskStatus(999)},
 		{name: "negative_status", status: taskv1.TaskStatus(-1)},
 		{name: "pending_is_not_worker_progress", status: taskv1.TaskStatus_TASK_STATUS_PENDING},
-		{name: "cancellation_is_not_implemented", status: taskv1.TaskStatus_TASK_STATUS_CANCELLED},
+		// 5 was TASK_STATUS_CANCELLED, now reserved; an old client may still send it.
+		{name: "removed_cancelled_value", status: taskv1.TaskStatus(5)},
 		{name: "completed_at_zero", status: taskv1.TaskStatus_TASK_STATUS_COMPLETED},
 		{name: "completed_at_99", status: taskv1.TaskStatus_TASK_STATUS_COMPLETED, progress: 99},
 		{name: "running", status: taskv1.TaskStatus_TASK_STATUS_RUNNING, progress: 42, accepted: true},

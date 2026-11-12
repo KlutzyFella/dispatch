@@ -6,10 +6,11 @@ BIN_DIR   := bin
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
-## install-tools: install protoc plugins (requires Go in PATH)
+## install-tools: install the protoc plugin versions that generated gen/
+##     (also needs protoc 3.21.12 on PATH; see the headers in gen/task/v1)
 install-tools:
-	go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
 
 ## setup: full first-time setup (install tools → generate → tidy)
 setup: install-tools generate tidy
