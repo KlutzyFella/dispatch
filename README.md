@@ -304,8 +304,11 @@ Measured on one laptop with the load generator on the same machine
   and at 7,000 req/s in 3 of 3; above that the boundary is noisy. Across
   20.2 million requests every response was `ACCEPTED`, and every accepted
   task was verified in Kafka exactly once.
-- A soak of 2,400 tasks through 8 workers lost none: 2,380 completed and
-  20 ended in the DLQ after exhausting their retries.
+- Soaks lost no task: 20,000 tasks through 32 workers (19,769 completed,
+  231 in the DLQ); every message then delivered a second time with zero new
+  executions; and 10,000 tasks each executed twice concurrently, where 924
+  duplicates were absorbed. That run also measured a documented limitation:
+  4.95% of tasks ended both COMPLETED and in the DLQ.
 
 Worker throughput is not benchmarked: a task is a two-second simulated timer.
 

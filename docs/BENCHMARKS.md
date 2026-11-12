@@ -148,67 +148,113 @@ python3 scripts/bench/summarize.py sweep.jsonl
 `--delete-volumes` is required because every repetition deletes this
 project's Kafka and Redis data.
 
-## 2. Zero-loss soak
+## 2. Zero-loss soaks
 
-`scripts/bench/soak.py` submits tasks through the whole stack and accounts
-for every one of them.
+`scripts/bench/soak.py` submits tasks through the whole stack, waits until
+every partition's consumer lag is 0 and every task is terminal, then accounts
+for each task. **Lost** means admitted (has a Redis record) but neither
+COMPLETED nor present in `tasks.dead_letter`. Every run also requires: every
+task published, exactly one pending-topic record per task, no task over its
+attempt budget, and zero final lag. Workers keep the production 10% simulated
+failure rate, and tasks use `max_retries=1` (two attempts). Rates come with
+95% Wilson intervals.
 
-### Method
+The three runs below are measured at `ebf7ef5` (the concurrent run) and
+`ab65008` (the others), from deleted volumes each time.
 
-- Deleted volumes, then `stack.sh` with **8 workers on 8 partitions**. The
-  stack reports ready only once the consumer group is Stable with exactly 8
-  members.
-- **2,400 tasks** submitted through ghz at 50 req/s, `max_retries=1` (two
-  attempts), no idempotency key. Workers keep the production 10% simulated
-  failure rate, so some tasks retry and about 1% exhaust both attempts.
-- Wait until every partition's consumer lag is 0 and every task is terminal:
-  COMPLETED, or FAILED with both attempts used.
-- **Lost** means admitted (has a Redis record) but neither COMPLETED nor
-  present in `tasks.dead_letter`. The run also requires: every task
-  published, the pending topic holding exactly one record per task, no task
-  over its attempt budget, and no task both completed and quarantined.
-
-### Result
+### 2a. Volume: 20,000 tasks, 32 workers, 32 partitions
 
 | | |
 |---|---|
-| submitted / `ACCEPTED` | 2,400 / 2,400 |
-| admitted (Redis records) / pending-topic records | 2,400 / 2,400 |
-| COMPLETED | 2,380 |
-| in the DLQ (records / distinct tasks) | 20 / 20 |
+| submitted / `ACCEPTED` / admitted / pending-topic records | 20,000 / 20,000 / 20,000 / 20,000 |
+| COMPLETED / in the DLQ (records = distinct tasks) | 19,769 / 231 |
 | **lost** | **0** |
-| completed and also quarantined | 0 |
-| over the attempt budget | 0 |
-| attempts used: 1 / 2 | 2,134 / 266 |
-| final consumer lag | 0 |
-| time from first submission to all terminal | 798 s |
+| completed and quarantined / over the attempt budget | 0 / 0 |
+| first attempt failed | 2,089 = 10.45% (95% CI 10.03-10.88%) |
+| both attempts failed | 231 = 1.155% (95% CI 1.016-1.313%) |
+| retry recovered | 1,858 of 2,089 = 88.9% (95% CI 87.5-90.2%) |
+| first submission to all terminal | 1,590 s |
 
-The attempt counts fit the simulated failure rate: 266 tasks needed a second
-attempt (about 240 expected at 10%) and 20 exhausted both (about 24 expected
-at 1%). The 798 s is the two-second simulated work spread over 8 workers, not
-a throughput result.
+The per-attempt failure rates are consistent with the configured 10%. The
+nominal 1% for both attempts failing (derived as 10% × 10%, not configured)
+falls just below its interval; with three intervals at 95%, one near miss is
+weak evidence and is reported as is. The 1,590 s is the two-second simulated
+work spread over 32 workers, not a throughput result.
 
-**The first soak attempt failed, and it found a bug.** The stack reported
-ready while the group was still rebalancing. A message already being
-executed was handed to a newly joined worker. The first copy completed; the
-second copy's simulated attempt failed, and its FAILED update was correctly
-refused by the completed-task guard. The worker treated that refusal as fatal,
-so the stack stopped five seconds in. Nothing was lost. Two fixes followed, each
-with a regression shown red before and green after:
+### 2b. Replay: every message of 2a delivered a second time
 
-- the worker now re-reads a task whose update was refused, and treats a
-  duplicate that another delivery already COMPLETED as handled
-  (`TestConsumer_DuplicateFinishedElsewhereIsHandled`);
-- `stack.sh` waits for a Stable group with exactly N members.
+After 2a the stack was stopped and the worker group rewound to the earliest
+offsets (lag 20,000, measured before any worker started). The stack was then
+restarted on the same data.
 
-The passing run above had no duplicate deliveries, because the readiness fix
-removed the startup rebalance. The duplicate-handling fix is covered by its
-regression test, not by this soak.
+| | |
+|---|---|
+| messages redelivered | 20,000 |
+| **new attempts started** | **0** |
+| tasks whose (status, attempts) changed | 0 |
+| DLQ records, before / after | 231 / 462 (still 231 distinct tasks) |
+
+The completed-task check skips redelivered COMPLETED tasks before any attempt.
+The exhausted-budget path quarantines again without executing. One extra DLQ
+record per quarantined task is the documented at-least-once quarantine. This
+is sequential redelivery; it does not exercise concurrent duplicates.
+
+### 2c. Concurrent duplicates: 10,000 tasks, each executed twice at once
+
+A second consumer group of 24 workers read the same topic for the whole run,
+next to the stack's 24 workers on 24 partitions. Every task was therefore
+delivered to two workers at about the same time. That is what a rebalance does
+to in-flight messages, here applied to every message.
+
+| | |
+|---|---|
+| submitted / `ACCEPTED` / admitted / pending-topic records | 10,000 / 10,000 / 10,000 / 10,000 |
+| **lost** | **0** |
+| attempts started | 20,000 (2 per task: the shared budget, never exceeded) |
+| late updates refused and handled as "completed elsewhere" | 924 |
+| workers that retried a `RebalanceInProgress` fetch error | 12 (none exited) |
+| COMPLETED | 9,894 |
+| both copies' attempts failed (status FAILED) | 106 = 1.06% (95% CI 0.88-1.28%) |
+| **COMPLETED and also quarantined** | **495 = 4.95% (95% CI 4.54-5.39%)** |
+| DLQ records / distinct tasks | 707 / 601 (= 106 + 495) |
+| final consumer lag, both groups | 0 |
+
+**What this run shows.** No task was lost, no budget was exceeded, and no
+worker died while 924 duplicates were refused and absorbed. A refusal like
+that stopped the stack in the first soak attempt (below). The run also
+measures a documented limitation: the two copies share one attempt budget,
+and exhaustion is decided from attempts started, not finished. So one copy's
+failure can quarantine a task while the other copy's attempt is still running
+and then succeeds. Under constant duplication that happened to about 1 in
+20 tasks. Real duplicates only occur around rebalances, so this is a worst
+case. A DLQ entry is therefore not proof of failure; see the README's DLQ
+section.
+
+### How the soaks found bugs
+
+Each of these was fixed with a regression shown red before and green after:
+
+1. **First 2,400-task attempt: the stack died 5 seconds in.** A rebalance
+   handed an in-flight message to a newly joined worker. The first copy
+   completed, and the second copy's FAILED update was correctly refused.
+   The worker treated that refusal as fatal, and the supervisor stopped
+   everything. Fixed in `b9f7964`: a refused update is re-checked, and a
+   task another delivery completed counts as handled. Also `a49de56`:
+   `stack.sh` reported ready mid-rebalance and counted stale members of
+   killed workers, so it now waits for a Stable group with exactly N
+   members. The rerun of that soak then passed: 2,400 tasks, 0 lost.
+2. **First concurrent-duplicate attempt: 4 of 24 workers exited at
+   startup.** With 24 workers joining a group at once, kafka-go returned
+   `RebalanceInProgress` from `FetchMessage`. That error is not in its
+   `Temporary()` list, but its reader keeps rejoining anyway. Fixed in
+   `ebf7ef5`: fetch errors are retried with backoff for up to 60 s.
+3. **Concurrent duplicates: tasks COMPLETED and quarantined.** This one was
+   documented, not fixed (above).
 
 ### Not covered
 
-No process or broker was killed during the soak; the supervisor stops the whole
-stack when a component dies, so this soak cannot exercise that. Crash and restart
+No process or broker was killed during a soak; the supervisor stops the whole
+stack when a component dies, so the soaks cannot exercise that. Crash and restart
 recovery are covered by the integration tests instead (SIGKILL of dispatch
 before and after the Kafka acknowledgement, consumer replay after restart,
 live rebalance handoff). Single broker, no replication; Redis data loss is not
@@ -217,5 +263,6 @@ tested.
 ### Reproduce
 
 ```bash
-python3 scripts/bench/soak.py --delete-volumes --tasks 2400 --workers 8 --rate 50 --out soak.json
+python3 scripts/bench/soak.py --delete-volumes --tasks 20000 --workers 32 --rate 100 --replay --out soak-20k.json
+python3 scripts/bench/soak.py --delete-volumes --tasks 10000 --workers 24 --rate 100 --duplicate-group 24 --out soak-dup.json
 ```
