@@ -2,7 +2,7 @@ PROTO_DIR := proto
 GEN_DIR   := gen
 BIN_DIR   := bin
 
-.PHONY: install-tools generate build build-worker test lint run run-worker up logs clean setup docker-build
+.PHONY: install-tools generate build build-worker test test-integration test-stack lint run run-worker up logs clean setup docker-build
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
@@ -41,14 +41,29 @@ build:
 build-worker:
 	go build -o $(BIN_DIR)/worker ./cmd/worker
 
-## test: run all tests with race detector and coverage
+## test: unit tier only (no Kafka/Redis needed), with the race detector
 test:
-	go test ./... -v -race -coverprofile=coverage.out
-	go tool cover -func=coverage.out | tail -1
+	go test -race -count=1 ./...
 
-## lint: run static analysis
+## test-integration: full tier against real Kafka and Redis; any skipped test
+##     fails. Start them first: docker compose up -d --wait kafka redis
+test-integration:
+	go test -tags=integration -race -count=1 -timeout=900s -json ./... > test-results.json; \
+		status=$$?; python3 scripts/ci/gotest_summary.py --no-skips test-results.json && exit $$status
+
+## test-stack: drive `make up` end to end (needs Docker, curl and grpcurl)
+test-stack:
+	./scripts/test-stack.sh
+
+## lint: formatting, vet under both build tags, module checksums and drift;
+##     fails on any diff
 lint:
+	@unformatted=$$(gofmt -l $$(git ls-files '*.go')); \
+		if [ -n "$$unformatted" ]; then echo "gofmt needed:"; gofmt -d $$unformatted; exit 1; fi
 	go vet ./...
+	go vet -tags=integration ./...
+	go mod verify
+	go mod tidy -diff
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 

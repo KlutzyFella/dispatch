@@ -289,8 +289,12 @@ make setup          # Install protoc plugins, generate bindings, tidy
 make generate       # Compile task.proto → Go bindings
 make build          # Build dispatch server binary
 make build-worker   # Build worker binary
-make test           # Run tests with race detector + coverage report
-make lint           # go vet
+make up             # Start and supervise the whole stack (see Local Quickstart)
+make logs           # Follow the stack's logs
+make lint           # gofmt diff, go vet (both build tags), go mod verify, go mod tidy -diff
+make test           # Unit tier, race detector; no Kafka/Redis needed
+make test-integration  # Full tier against real Kafka/Redis; fails on any skip
+make test-stack     # Drive `make up` end to end (needs curl and grpcurl)
 make docker-build   # Build both Docker images
 make clean          # Remove generated artifacts and binaries
 ```
@@ -314,19 +318,44 @@ Worker throughput is not benchmarked: a task is a two-second simulated timer.
 
 ## Tests
 
-Start Kafka and Redis, verify that both answer protocol requests, then include
-the real-Kafka regression tests with the `integration` build tag:
+Two tiers. The unit tier needs nothing running:
 
 ```bash
-docker compose up -d kafka redis
-docker compose exec -T redis redis-cli ping
-docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
-GOTOOLCHAIN=go1.23.0 go test -tags=integration -count=1 -race ./...
+make test
 ```
 
-Kafka tests use `localhost:9092` by default, accept `KAFKA_BROKER` as an override,
-and fail when the broker is unavailable. They create uniquely named topics and
-delete those topics at cleanup. Integration-tagged Redis regressions default to
-`localhost:6379`, accept `REDIS_ADDR`, and fail if Redis is absent. Older Redis
-tests in the default suite still use `localhost:6379` and skip if it is absent.
-The commands above provide both services.
+The integration tier (`-tags=integration`) runs every test, including the unit
+tier, against real Kafka and Redis. Start them first with the same Compose file
+the stack uses:
+
+```bash
+docker compose up -d --wait kafka redis
+make test-integration
+```
+
+`make test-integration` writes `go test -json` output to `test-results.json` and
+prints top-level and leaf test counts plus the full output of anything that
+failed. **A skipped test fails the run**: a skip in this tier would mean missing
+infrastructure was reported as a pass. Integration tests fail, not skip, when
+Kafka or Redis is unreachable. They default to `localhost:9092` and
+`localhost:6379` and accept `KAFKA_BROKER` and `REDIS_ADDR` as overrides. Kafka
+tests create uniquely named topics and delete them at cleanup.
+
+`make test-stack` runs `scripts/test-stack.sh`. It starts the real stack several
+times and checks preflight rejections, a task completing, Ctrl-C, SIGTERM,
+component and Kafka death, and multi-worker startup. Afterwards it checks for
+orphaned processes and held ports.
+
+### CI
+
+`.github/workflows/ci.yml` runs three jobs on Go 1.23.0 (the `go.mod` minimum,
+with `GOTOOLCHAIN=local`):
+
+- **checks**: `make lint`, `make test`
+- **integration**: `docker compose up -d --wait kafka redis`, then
+  `make test-integration`. It uses the same Compose file as local development,
+  not GitHub `services:`, which cannot set Redis's AOF command.
+- **stack**: `make test-stack`
+
+On failure, the integration and stack jobs print Kafka and Redis logs and
+upload test output and component logs as artifacts.

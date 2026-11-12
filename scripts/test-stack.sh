@@ -16,7 +16,17 @@ export STACK_DIR=$WORK/stack
 PORTS=(50051 9090 9091 9101 9111 9092 6379)
 FAILED=0 PASSED=0 STACK_PID=""
 
-trap 'stop_stack; rm -rf "$WORK"' EXIT
+# STACK_TEST_ARTIFACTS=DIR keeps the component logs (CI uploads them); the
+# temporary directory itself is always removed.
+cleanup() {
+	stop_stack
+	if [[ -n ${STACK_TEST_ARTIFACTS:-} && -d $STACK_DIR/logs ]]; then
+		mkdir -p "$STACK_TEST_ARTIFACTS"
+		cp -r "$STACK_DIR/logs/." "$STACK_TEST_ARTIFACTS/"
+	fi
+	rm -rf "$WORK"
+}
+trap cleanup EXIT
 
 say() { printf '\n=== %s\n' "$*"; }
 pass() { echo "PASS: $*"; PASSED=$((PASSED + 1)); }

@@ -4,3 +4,5 @@
 /bin/
 # Python bytecode from scripts/bench
 __pycache__/
+# go test -json output from make test-integration
+/test-results.json
