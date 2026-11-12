@@ -1,5 +1,3 @@
-// Tests are written first per TDD workflow.
-// Run `make generate` before `make test` to produce the required proto bindings.
 package server_test
 
 import (
