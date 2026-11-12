@@ -22,8 +22,10 @@ type mockReader struct {
 	messages []kafka.Message
 	idx      int
 	fetchErr error
-	closeErr error
-	onCommit func() // called after each CommitMessages, if non-nil
+	// fetchErrs are returned by successive FetchMessage calls before any message.
+	fetchErrs []error
+	closeErr  error
+	onCommit  func() // called after each CommitMessages, if non-nil
 	// commitErrs are returned by successive CommitMessages calls; later calls succeed.
 	commitErrs []error
 	committed  []string // keys passed to CommitMessages, including failed commits
@@ -35,6 +37,11 @@ func (m *mockReader) FetchMessage(ctx context.Context) (kafka.Message, error) {
 	}
 	if m.fetchErr != nil {
 		return kafka.Message{}, m.fetchErr
+	}
+	if len(m.fetchErrs) > 0 {
+		err := m.fetchErrs[0]
+		m.fetchErrs = m.fetchErrs[1:]
+		return kafka.Message{}, err
 	}
 	if m.idx >= len(m.messages) {
 		<-ctx.Done()
@@ -461,12 +468,16 @@ func TestConsumer_Run_ProcessesOneMessage(t *testing.T) {
 func TestConsumer_Run_FetchError(t *testing.T) {
 	t.Parallel()
 
+	// Fetch errors are retried, but not forever: a persistent failure must
+	// still stop the worker once the retry window has passed.
 	reader := &mockReader{fetchErr: errors.New("broker unavailable")}
 	c := newTestConsumer(&mockSender{})
 	c.reader = reader
+	c.fetchErrorWindow = 100 * time.Millisecond
 
-	if err := c.Run(context.Background()); err == nil {
-		t.Fatal("expected error from fetch failure, got nil")
+	err := c.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "still failing after") {
+		t.Fatalf("persistent fetch failure must stop the worker after the window, got %v", err)
 	}
 }
 
@@ -600,5 +611,29 @@ func TestConsumer_Run_CommitFailureForHandledWorkContinues(t *testing.T) {
 	}
 	if sender.callCount != 4 {
 		t.Errorf("progress updates = %d; want RUNNING and COMPLETED for both messages", sender.callCount)
+	}
+}
+
+// kafka-go hands a consumer-group error such as RebalanceInProgress to a
+// waiting FetchMessage once, then keeps retrying the group protocol itself.
+// RebalanceInProgress is not in kafka-go's Temporary() list, yet it heals.
+// When 24 workers joined a group at once, 4 exited on it, although nothing
+// had been fetched. A fetch error must be retried, not end the worker.
+func TestConsumer_Run_RetriesFetchErrorDuringRebalance(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	reader := &mockReader{
+		fetchErrs: []error{kafka.RebalanceInProgress, kafka.RebalanceInProgress},
+		messages:  []kafka.Message{{Key: []byte("after-rebalance"), Value: marshalTask(t, &taskv1.Task{Type: "simulation"})}},
+		onCommit:  cancel,
+	}
+	c := newTestConsumer(&mockSender{})
+	c.reader = reader
+	if err := c.Run(ctx); err != nil {
+		t.Fatalf("a rebalance error stopped the worker: %v", err)
+	}
+	if got := strings.Join(reader.committed, ","); got != "after-rebalance" {
+		t.Errorf("committed %q; want the message fetched after the rebalance", got)
 	}
 }

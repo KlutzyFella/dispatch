@@ -91,6 +91,8 @@ return fmt.Errorf("processing message from %s[%d] at offset %d: %w",
 
 The worker closes its reader and exits nonzero on that error. This prevents a later commit from passing the failed message. Real-Kafka integration tests verify the committed offset and that a new reader in the same group can fetch the unresolved message. Cancellation shuts down without committing interrupted work.
 
+Errors from `FetchMessage` itself are different: nothing has been fetched, and kafka-go keeps rejoining the group after reporting a group error such as `RebalanceInProgress`. The worker retries them with backoff (250 ms up to 2 s) and exits only if fetches keep failing for 60 s. During a rebalance, closing the reader on shutdown was observed to take up to about 30 s.
+
 Progress updates require `recorded=true`, including FAILED updates for exhausted replays. A successful gRPC exchange with `recorded=false` means the state update was rejected: the worker stops with an error and leaves the source message uncommitted. The one exception is a task another delivery has already completed (a rebalance can hand an in-flight message to a second worker): the worker re-reads the task, finds it COMPLETED, and treats its duplicate as handled. Transport errors also stop consumption. Each update must be acknowledged within ten seconds; a silent dispatch peer aborts the stream and stops the worker rather than leaving it blocked. The stream is not reconnected. A started attempt remains counted; rejecting RUNNING prevents work, while rejecting COMPLETED can occur after work has already happened.
 
 Worker progress accepts RUNNING, FAILED, and COMPLETED only, with percentages

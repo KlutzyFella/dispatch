@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand"
 	"time"
@@ -14,6 +15,17 @@ import (
 	taskv1 "github.com/ronnitchopra/dispatch/gen/task/v1"
 	"github.com/ronnitchopra/dispatch/internal/metrics"
 	"github.com/ronnitchopra/dispatch/internal/state"
+)
+
+// Fetch errors are retried, because kafka-go keeps running the consumer-group
+// protocol after handing a group error (for example RebalanceInProgress, which
+// is not in its Temporary() list) to a waiting FetchMessage. Nothing has been
+// fetched, so retrying risks no work. Errors lasting longer than the window
+// still stop the worker, so a persistent outage fails loudly.
+const (
+	defaultFetchErrorWindow = 60 * time.Second
+	fetchRetryMin           = 250 * time.Millisecond
+	fetchRetryMax           = 2 * time.Second
 )
 
 // errCompletedElsewhere reports a refused update for a task that another
@@ -58,6 +70,9 @@ type Consumer struct {
 	failureDecider func() bool // returns true to simulate task failure
 	workerID       string
 	logger         *slog.Logger
+	// fetchErrorWindow bounds how long consecutive fetch errors are retried;
+	// zero means defaultFetchErrorWindow.
+	fetchErrorWindow time.Duration
 }
 
 // NewConsumer creates a Consumer backed by a segmentio/kafka-go Reader.
@@ -99,6 +114,8 @@ func (c *Consumer) Run(ctx context.Context) error {
 		slog.String("worker_id", c.workerID),
 	)
 
+	var failingSince time.Time
+	backoff := fetchRetryMin
 	for {
 		msg, err := c.reader.FetchMessage(ctx)
 		if err != nil {
@@ -106,8 +123,31 @@ func (c *Consumer) Run(ctx context.Context) error {
 				c.logger.Info("consumer shutting down")
 				return nil
 			}
-			return fmt.Errorf("fetching message: %w", err)
+			if errors.Is(err, io.EOF) { // the reader was closed
+				return fmt.Errorf("fetching message: %w", err)
+			}
+			window := c.fetchErrorWindow
+			if window <= 0 {
+				window = defaultFetchErrorWindow
+			}
+			if failingSince.IsZero() {
+				failingSince = time.Now()
+			}
+			if time.Since(failingSince) >= window {
+				return fmt.Errorf("fetching message: still failing after %v: %w", window, err)
+			}
+			c.logger.Warn("fetch failed; retrying", slog.String("error", err.Error()),
+				slog.Duration("failing_for", time.Since(failingSince)), slog.Duration("retry_in", backoff))
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				c.logger.Info("consumer shutting down")
+				return nil
+			}
+			backoff = min(2*backoff, fetchRetryMax)
+			continue
 		}
+		failingSince, backoff = time.Time{}, fetchRetryMin
 
 		if err := c.processMessage(ctx, msg.Key, msg.Value); err != nil {
 			if ctx.Err() != nil {
